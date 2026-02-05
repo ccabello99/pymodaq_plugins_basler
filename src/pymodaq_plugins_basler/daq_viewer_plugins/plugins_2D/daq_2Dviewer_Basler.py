@@ -241,8 +241,11 @@ class DAQ_2DViewer_Basler(DAQ_Viewer_base):
                 return
 
             # All the rest, just do :
-            camera_attr = getattr(self.controller.camera, name)
-            camera_attr.SetValue(value)
+            try:
+                camera_attr = getattr(self.controller.camera, name)
+                camera_attr.SetValue(value)
+            except Exception:
+                pass
 
         if name == "update_roi":
             if value:  # Switching on ROI
@@ -547,8 +550,11 @@ class DAQ_2DViewer_Basler(DAQ_Viewer_base):
                     # Special case: skip these
                     if child_name == 'TriggerSaveOptions':
                         continue
-
-                    camera_attr = getattr(self.controller.camera, child_name)
+                    
+                    try:
+                        camera_attr = getattr(self.controller.camera, child_name)
+                    except Exception:
+                        pass
 
                     try:
                         if child_type in ['float', 'slide', 'int', 'str']:
@@ -585,7 +591,10 @@ class DAQ_2DViewer_Basler(DAQ_Viewer_base):
                     except Exception:
                         pass
             else:
-                camera_attr = getattr(self.controller.camera, param_name)
+                try:
+                    camera_attr = getattr(self.controller.camera, param_name)
+                except Exception:
+                    pass                    
                 try:
                     if param_type in ['float', 'slide', 'int', 'str']:
                         value = camera_attr.GetValue()
