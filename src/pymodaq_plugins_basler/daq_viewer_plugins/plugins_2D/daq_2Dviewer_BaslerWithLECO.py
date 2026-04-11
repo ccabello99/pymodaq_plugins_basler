@@ -3,21 +3,20 @@ import os
 import imageio as iio
 import h5py
 import json
+from datetime import datetime
 from uuid6 import uuid7
+from typing import Optional
 
 from pymodaq.utils.parameter import Parameter
 from pymodaq.utils.data import Axis, DataFromPlugins, DataToExport
 from pymodaq.utils.daq_utils import ThreadCommand
 from pymodaq.control_modules.viewer_utility_classes import main, DAQ_Viewer_base, comon_parameters, params
 
-from typing import Optional
-
-
-# Suppress only NumPy RuntimeWarnings (bc of crosshair bug)
 import warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
 
 from pymodaq_plugins_basler.hardware.basler import BaslerCamera, TemperatureMonitor
+from pymodaq_plugins_basler.hardware.burst_writer import BurstWriter
 from pymodaq_plugins_basler.resources.extended_publisher import ExtendedPublisher
 from qtpy import QtWidgets, QtCore
 
@@ -26,96 +25,144 @@ if not hasattr(QtCore, "pyqtSignal"):
 
 
 class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
-    """Viewer for Basler cameras
-    """
+    """Viewer for Basler cameras with LECO integration and burst-mode HDF5 recording."""
+
     controller: BaslerCamera
     live_mode_available = True
 
-    # For Basler, this returns a list of user defined camera names
     camera_list = [cam.GetFriendlyName() for cam in BaslerCamera.list_cameras()]
-
-    # Default place to store qsettings for this module
     settings_basler = QtCore.QSettings("PyMoDAQ", "Basler")
 
-    # Update the params
-    params = comon_parameters + [{'title': 'Camera List:', 'name': 'camera_list', 'type': 'list', 'value': '', 'limits': camera_list},
+    params = comon_parameters + [
+        {'title': 'Camera List:', 'name': 'camera_list', 'type': 'list',
+         'value': '', 'limits': camera_list},
+
         {"title": "Device Info", "name": "device_info", "type": "group", "children": [
-            {"title": "Device Model Name", "name": "DeviceModelName", "type": "str", "value": "", "readonly": True},
-            {"title": "Device Serial Number", "name": "DeviceSerialNumber", "type": "str", "value": "", "readonly": True},
-            {"title": "Device Version", "name": "DeviceVersion", "type": "str", "value": "", "readonly": True},
-            {"title": "Device User ID", "name": "DeviceUserID", "type": "str", "value": ""}
-        ]},                                 
+            {"title": "Device Model Name", "name": "DeviceModelName",
+             "type": "str", "value": "", "readonly": True},
+            {"title": "Device Serial Number", "name": "DeviceSerialNumber",
+             "type": "str", "value": "", "readonly": True},
+            {"title": "Device Version", "name": "DeviceVersion",
+             "type": "str", "value": "", "readonly": True},
+            {"title": "Device User ID", "name": "DeviceUserID",
+             "type": "str", "value": ""},
+        ]},
+
         {'title': 'ROI', 'name': 'roi', 'type': 'group', 'children': [
-            {'title': 'Update ROI', 'name': 'update_roi', 'type': 'bool_push', 'value': False, 'default': False},
-            {'title': 'Clear ROI+Bin', 'name': 'clear_roi', 'type': 'bool_push', 'value': False, 'default': False},
-            {'title': 'Binning', 'name': 'binning', 'type': 'list', 'limits': [1, 2], 'default': 1},
-            {'title': 'Image Width', 'name': 'width', 'type': 'int', 'value': 1280, 'readonly': True},
-            {'title': 'Image Height', 'name': 'height', 'type': 'int', 'value': 960, 'readonly': True},
+            {'title': 'Update ROI', 'name': 'update_roi',
+             'type': 'bool_push', 'value': False, 'default': False},
+            {'title': 'Clear ROI+Bin', 'name': 'clear_roi',
+             'type': 'bool_push', 'value': False, 'default': False},
+            {'title': 'Binning', 'name': 'binning', 'type': 'list',
+             'limits': [1, 2], 'default': 1},
+            {'title': 'Image Width', 'name': 'width',
+             'type': 'int', 'value': 1280, 'readonly': True},
+            {'title': 'Image Height', 'name': 'height',
+             'type': 'int', 'value': 960, 'readonly': True},
+        ]},
+
+        {'title': 'Burst Recording', 'name': 'burst', 'type': 'group', 'children': [
+            {'title': 'Enable Burst Mode', 'name': 'burst_enable',
+             'type': 'led_push', 'value': False, 'default': False,
+             'tip': 'Arms burst mode. Actual acquisition starts with the next '
+                    '"grab". Requires trigger mode to be active.'},
+            {'title': 'Save Path', 'name': 'burst_path',
+             'type': 'browsepath', 'value': '', 'filetype': False,
+             'tip': 'Directory where the HDF5 burst file will be written.'},
+            {'title': 'Filename Prefix', 'name': 'burst_prefix',
+             'type': 'str', 'value': 'burst',
+             'tip': 'File will be named <prefix>_YYYYMMDD_HHMMSS.h5'},
+            {'title': 'Stop Condition', 'name': 'burst_stop_group',
+             'type': 'group', 'children': [
+                 {'title': 'Max Frames (0 = time-bounded)', 'name': 'burst_nframes',
+                  'type': 'int', 'value': 1000, 'min': 0,
+                  'tip': 'Set to 0 to use Max Seconds instead.'},
+                 {'title': 'Max Seconds (0 = frame-bounded)', 'name': 'burst_nseconds',
+                  'type': 'float', 'value': 0.0, 'min': 0.0,
+                  'tip': 'Set to 0 to use Max Frames instead.'},
+             ]},
+            {'title': 'Performance', 'name': 'burst_perf_group',
+             'type': 'group', 'children': [
+                 {'title': 'Display Every Nth Frame', 'name': 'burst_display_nth',
+                  'type': 'int', 'value': 40, 'min': 1,
+                  'tip': '40 → ~25 Hz display refresh at 1 kHz acquisition.'},
+                 {'title': 'Write Chunk Size', 'name': 'burst_chunk',
+                  'type': 'int', 'value': 50, 'min': 1,
+                  'tip': 'Frames written per HDF5 extend call. '
+                         'Larger = fewer I/O calls but more end-of-burst latency.'},
+                 {'title': 'Queue Max Size', 'name': 'burst_queue_size',
+                  'type': 'int', 'value': 500, 'min': 10,
+                  'tip': 'In-process queue depth. If the writer falls behind '
+                         'and the queue fills, frames are dropped.'},
+                 {'title': 'Overflow Policy', 'name': 'burst_overflow',
+                  'type': 'list',
+                  'limits': ['drop_newest', 'drop_oldest'],
+                  'value': 'drop_newest',
+                  'tip': 'drop_newest: discard incoming frame when queue is full. '
+                         'drop_oldest: discard oldest queued frame to make room.'},
+             ]},
+            {'title': 'Status', 'name': 'burst_status',
+             'type': 'str', 'value': 'Idle', 'readonly': True},
+            {'title': 'Frames Written', 'name': 'burst_written',
+             'type': 'int', 'value': 0, 'readonly': True},
+            {'title': 'Frames Dropped', 'name': 'burst_dropped',
+             'type': 'int', 'value': 0, 'readonly': True},
+            {'title': 'Elapsed (s)', 'name': 'burst_elapsed',
+             'type': 'float', 'value': 0.0, 'readonly': True},
         ]},
         {'title': 'LECO Logging', 'name': 'leco_log', 'type': 'group', 'children': [
-            {'title': 'Send Frame Data ?', 'name': 'leco_send', 'type': 'led_push', 'value': False, 'default': False,
-                'tip': 'This leads to huge performance drop as of now. Only use for single grabs, not continuous'},
+            {'title': 'Send Frame Data?', 'name': 'leco_send',
+             'type': 'led_push', 'value': False, 'default': False,
+             'tip': 'Huge performance drop. Only use for single grabs, not continuous.'},
             {'title': 'Publisher Name', 'name': 'publisher_name', 'type': 'str', 'value': ''},
-            {'title': 'Proxy Server Address', 'name': 'proxy_address', 'type': 'str', 'value': 'localhost', 'default': 'localhost',
-                'tip': 'Either IP or hostname of LECO proxy server'},
-            {'title': 'Proxy Server Port', 'name': 'proxy_port', 'type': 'int', 'value': 11100, 'default': 11100},
-            {'title': 'Metadata', 'name': 'leco_metadata', 'type': 'str', 'value': '', 'readonly': True},
-            {'title': 'Saving Base Path:', 'name': 'leco_basepath', 'type': 'browsepath', 'value': '', 'filetype': False,
-                'tip': 'This is the base directory for a file path sent from a remote director in the metadata'},
-        ]}
-        ]
+            {'title': 'Proxy Server Address', 'name': 'proxy_address',
+             'type': 'str', 'value': 'localhost', 'default': 'localhost'},
+            {'title': 'Proxy Server Port', 'name': 'proxy_port',
+             'type': 'int', 'value': 11100, 'default': 11100},
+            {'title': 'Metadata', 'name': 'leco_metadata',
+             'type': 'str', 'value': '', 'readonly': True},
+            {'title': 'Saving Base Path:', 'name': 'leco_basepath',
+             'type': 'browsepath', 'value': '', 'filetype': False},
+        ]},
+    ]
 
     def ini_attributes(self):
-        """Initialize attributes"""
-
-        self.controller: None
+        self.controller: Optional[BaslerCamera] = None
         self.user_id = None
-
         self.data_shape = None
+
+        # Normal trigger-save state
         self.save_frame = False
 
-        # For LECO operation
+        # LECO state
         self.metadata = None
         self.data_publisher = None
         self.send_frame_leco = False
 
+        # Burst state
+        self._burst_active = False
+        self._burst_writer: Optional[BurstWriter] = None
+        self._burst_thread: Optional[QtCore.QThread] = None
+        self._burst_h5_path: Optional[str] = None
+
     def init_controller(self) -> BaslerCamera:
-        # Init camera 
         self.user_id = self.settings.param('camera_list').value()
-        self.emit_status(ThreadCommand('Update_Status', [f"Trying to connect to {self.user_id}", 'log']))
-        camera_list = BaslerCamera.list_cameras()
-        for devInfo in camera_list:
+        self.emit_status(ThreadCommand('Update_Status',
+                                       [f"Trying to connect to {self.user_id}", 'log']))
+        for devInfo in BaslerCamera.list_cameras():
             if devInfo.GetFriendlyName() == self.user_id:
                 return BaslerCamera(info=devInfo, callback=self.emit_data_callback)
         self.emit_status(ThreadCommand('Update_Status', ["Camera not found", 'log']))
         raise ValueError(f"Camera with name {self.user_id} not found anymore.")
 
     def ini_detector(self, controller=None):
-        """Detector communication initialization
-
-        Parameters
-        ----------
-        controller: (object)
-            custom object of a PyMoDAQ plugin (Slave case). None if only one actuator/detector by controller
-            (Master case)
-
-        Returns
-        -------
-        info: str
-        initialized: bool
-            False if initialization failed otherwise True
-        """
-        # Initialize camera class
         self.ini_detector_init(old_controller=controller,
                                new_controller=self.init_controller())
-        
-        # Setup continuous acquisition & allow adjustable frame rate
         self.controller.setup_acquisition()
+        self.controller.configurationEventHandler.signals.cameraRemoved.connect(
+            self.camera_lost
+        )
 
-        # Connect camera lost event
-        self.controller.configurationEventHandler.signals.cameraRemoved.connect(self.camera_lost)
-        
-        # Update the UI with available and current camera parameters
         self.add_attributes_to_settings()
         self.update_params_ui()
         for param in self.settings.children():
@@ -126,129 +173,122 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                 for child in param.children():
                     child.sigValueChanged.emit(child, child.value())
 
-        # Update image parameters
         (x0, xend, y0, yend, xbin, ybin) = self.controller.get_roi()
-        height = xend - x0
-        width = yend - y0
         self.settings.child('roi', 'binning').setValue(xbin)
-        self.settings.child('roi', 'width').setValue(width)
-        self.settings.child('roi', 'height').setValue(height)
+        self.settings.child('roi', 'width').setValue(yend - y0)
+        self.settings.child('roi', 'height').setValue(xend - x0)
 
-        # Setup data publisher for LECO if data publisher name is set (ideally it should match the LECO actor name)
         publisher_name = self.settings.child('leco_log', 'publisher_name').value()
         proxy_address = self.settings.child('leco_log', 'proxy_address').value()
         proxy_port = self.settings.child('leco_log', 'proxy_port').value()
-        if publisher_name == '':
-            print("Publisher name is not set ! Set this first and then reinitialize for LECO logging.")
-            self.emit_status(ThreadCommand('Update_Status', ["Publisher name is not set ! Set this first and then reinitialize for LECO logging."]))
+        if publisher_name:
+            self.data_publisher = ExtendedPublisher(
+                full_name=publisher_name, host=proxy_address, port=proxy_port
+            )
+            self.emit_status(ThreadCommand('Update_Status',
+                                           [f"Data publisher {publisher_name} initialised"]))
         else:
-            self.data_publisher = ExtendedPublisher(full_name=publisher_name, host=proxy_address, port=proxy_port)
-            print(f"Data publisher {publisher_name} initialized for LECO logging")
-            self.emit_status(ThreadCommand('Update_Status', [f"Data publisher {publisher_name} initialized for LECO logging"]))
+            self.emit_status(ThreadCommand('Update_Status',
+                                           ["Publisher name not set – LECO disabled"]))
 
-        
         try:
-            base_path = self.settings_basler.value('leco_log/basepath', os.path.join(os.path.expanduser('~'), 'Downloads'))
-        except Exception as e:
-            print(f"Error finding LECO base path: {e}")
+            base_path = self.settings_basler.value(
+                'leco_log/basepath', os.path.join(os.path.expanduser('~'), 'Downloads')
+            )
+        except Exception:
             base_path = ''
         self.settings.child('leco_log', 'leco_basepath').setValue(base_path)
 
-                
+        # Default burst path to Downloads if unset
+        if not self.settings.child('burst', 'burst_path').value():
+            self.settings.child('burst', 'burst_path').setValue(
+                os.path.join(os.path.expanduser('~'), 'Downloads')
+            )
+
         self._prepare_view()
-        info = "Initialized camera"
-        print(f"{self.user_id} camera initialized successfully")
-        self.emit_status(ThreadCommand('Update_Status', [f"{self.user_id} camera initialized successfully"]))
-        initialized = True
-        return info, initialized
+        self.emit_status(ThreadCommand('Update_Status',
+                                       [f"{self.user_id} initialised successfully"]))
+        return "Initialized camera", True
 
     def commit_settings(self, param: Parameter):
-        """Apply the consequences of a change of value in the detector settings
-
-        Parameters
-        ----------
-        param: Parameter
-            A given parameter (within detector_settings) whose value has been changed by the user
-        """
         name = param.name()
         value = param.value()
 
         if name == "camera_list":
-            if self.controller != None:
+            if self.controller is not None:
                 self.close()
             self.ini_detector()
+            return
 
         if name == "device_state_save":
             self.controller.save_device_state()
-            param = self.settings.child('device_state', 'device_state_save')
             param.setValue(False)
             param.sigValueChanged.emit(param, False)
             return
-        
+
         if name == "device_state_load":
             self.controller.stop_grabbing()
             self.controller.load_device_state()
-            # Reinitialize what is needed
             self.controller.setup_acquisition()
-            # Update the UI with available and current camera parameters
             self.add_attributes_to_settings()
             self.update_params_ui()
-            for param in self.settings.children():
-                param.sigValueChanged.emit(param, param.value())
-                if param.hasChildren():
-                    for child in param.children():
+            for p in self.settings.children():
+                p.sigValueChanged.emit(p, p.value())
+                if p.hasChildren():
+                    for child in p.children():
                         child.sigValueChanged.emit(child, child.value())
             self._prepare_view()
-            self.controller.start_grabbing(self.settings.param('AcquisitionFrameRateAbs').value())
-            self.emit_status(ThreadCommand('Update_Status', [f"Device state loaded"]))
+            self.controller.start_grabbing(
+                self.settings.param('AcquisitionFrameRateAbs').value()
+            )
+            self.emit_status(ThreadCommand('Update_Status', ["Device state loaded"]))
             return
-        
+
         if name == 'PixelFormat':
             self.controller.stop_grabbing()
             self.controller.camera.PixelFormat.SetValue(value)
             self._prepare_view()
-            self.controller.start_grabbing(self.settings.param('AcquisitionFrameRateAbs').value())
+            self.controller.start_grabbing(
+                self.settings.param('AcquisitionFrameRateAbs').value()
+            )
             return
-        
+
         if name == 'TriggerSave':
             if not self.settings.child('trigger', 'TriggerMode').value():
-                print("Trigger mode is not active ! Start triggering first !")
-                self.emit_status(ThreadCommand('Update_Status', ["Trigger mode is not active ! Start triggering first !"]))
-                param = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
-                param.setValue(False) # Turn off save on trigger if triggering is off
-                param.sigValueChanged.emit(param, False) 
+                self.emit_status(ThreadCommand('Update_Status',
+                                               ["Trigger mode is not active!"]))
+                p = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
+                p.setValue(False)
+                p.sigValueChanged.emit(p, False)
                 return
-            if value:
-                self.save_frame = True
-                return
-            else:
-                self.save_frame = False
-                return
-            
+            self.save_frame = bool(value)
+            return
+
         if name == 'leco_send':
-            if value:
-                self.send_frame_leco = True
-            else:
-                self.send_frame_leco = False
+            self.send_frame_leco = bool(value)
             return
         if name == 'leco_basepath':
-            base_path = value
-            if not os.path.exists(base_path):
-                print(f"LECO saving base path {base_path} does not exist !")
-                self.emit_status(ThreadCommand('Update_Status', [f"LECO saving base path {base_path} does not exist !"]))
-            else:
-                try:
-                    self.settings_basler.setValue('leco_log/basepath', base_path)
-                    print(f"LECO saving base path set to {base_path}")
-                    self.emit_status(ThreadCommand('Update_Status', [f"LECO saving base path set to {base_path}"]))
-                except Exception as e:
-                    print(f"Error setting LECO saving base path: {e}")
-                    self.emit_status(ThreadCommand('Update_Status', [f"Error setting LECO saving base path: {e}"]))
+            if os.path.exists(value):
+                self.settings_basler.setValue('leco_log/basepath', value)
+            return
         if name == 'leco_metadata':
-            self.metadata = json.loads(value)
-    
+            try:
+                self.metadata = json.loads(value)
+            except Exception:
+                self.metadata = None
+            return
+
+        if name == 'burst_enable':
+            # Just arming/disarming; actual burst starts in grab_data
+            if not value:
+                # User disarmed while idle – nothing to do
+                if not self._burst_active:
+                    return
+                # User disarmed while a burst is in progress – stop it
+                self._stop_burst()
+            return
+
         if name in self.controller.attribute_names:
-            # Special cases
             if 'ExposureTime' in name:
                 value = int(value * 1e3)
             if 'Gain' in name and 'Auto' not in name:
@@ -256,112 +296,488 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             if name == "DeviceUserID":
                 self.user_id = value
                 self.controller.camera.DeviceUserID.SetValue(value)
-                # Update the camera list to account for name change 
                 camera_list = [cam.GetFriendlyName() for cam in BaslerCamera.list_cameras()]
-                param = self.settings.param('camera_list')
-                param.setLimits(camera_list)
-                param.sigLimitsChanged.emit(param, camera_list)
+                p = self.settings.param('camera_list')
+                p.setLimits(camera_list)
+                p.sigLimitsChanged.emit(p, camera_list)
                 return
             if name == 'TriggerMode':
                 camera_attr = getattr(self.controller.camera, name)
-                if value:
-                    camera_attr.SetIntValue(1)
-                else:
+                camera_attr.SetIntValue(1 if value else 0)
+                if not value:
                     self.save_frame = False
-                    camera_attr.SetIntValue(0)
-                    param = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
-                    param.setValue(False) # Turn off save on trigger if we turn off triggering
-                    param.sigValueChanged.emit(param, False)
+                    p = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
+                    p.setValue(False)
+                    p.sigValueChanged.emit(p, False)
                 return
-            if name == 'GainAuto':
-                camera_attr = getattr(self.controller.camera, name)
-                if value:
-                    camera_attr.SetIntValue(1)
-                else:
-                    camera_attr.SetIntValue(0)
-                return
-            if name == 'ExposureAuto':
-                camera_attr = getattr(self.controller.camera, name)
-                if value:
-                    camera_attr.SetIntValue(1)
-                else:
-                    camera_attr.SetIntValue(0)
-                return
-            # we only need to reference these, nothing to do with the cam
-            if name == 'TriggerSaveLocation':
-                return
-            if name == 'TriggerSaveIndex':
-                return
-            if name == 'Filetype':
-                return
-            if name == 'Prefix':
-                return
-            if name == 'TemperatureMonitor':
-                if value:
-                    # Start thread for camera temp. monitoring
-                    self.start_temperature_monitoring()
-                else:
-                    # Stop background threads
-                    self.stop_temp_monitoring()
-                return
-
-            # All the rest, just do :
+            for auto_name in ('GainAuto', 'ExposureAuto'):
+                if name == auto_name:
+                    getattr(self.controller.camera, name).SetIntValue(1 if value else 0)
+                    return
+            for skip_name in ('TriggerSaveLocation', 'TriggerSaveIndex',
+                              'Filetype', 'Prefix', 'TemperatureMonitor'):
+                if name == skip_name:
+                    if name == 'TemperatureMonitor':
+                        if value:
+                            self.start_temperature_monitoring()
+                        else:
+                            self.stop_temp_monitoring()
+                    return
             camera_attr = getattr(self.controller.camera, name)
             camera_attr.SetValue(value)
+            return
 
-        if name == "update_roi":
-            if value:  # Switching on ROI
-
-                # We handle ROI and binning separately for clarity
-                (old_x, _, old_y, _, xbin, ybin) = self.controller.get_roi()  # Get current binning
-                y0, x0 = self.roi_info.origin.coordinates
-                height, width = self.roi_info.size.coordinates
-
-                # Values need to be rescaled by binning factor and shifted by current x0,y0 to be correct.
-                new_x = (old_x + x0) * xbin
-                new_y = (old_y + y0) * xbin
-                new_width = width * ybin
-                new_height = height * ybin
-                
-                new_roi = (new_x, new_width, xbin, new_y, new_height, ybin)
-                self.update_rois(new_roi)
-                param.setValue(False)
-                param.sigValueChanged.emit(param, False)
-        elif name == 'binning':
-            # We handle ROI and binning separately for clarity
-            (x0, w, y0, h, *_) = self.controller.get_roi()  # Get current ROI
-            xbin = self.settings.child('roi', 'binning').value()
-            ybin = self.settings.child('roi', 'binning').value()
-            new_roi = (x0, w, xbin, y0, h, ybin)
+        if name == "update_roi" and value:
+            (old_x, _, old_y, _, xbin, ybin) = self.controller.get_roi()
+            y0, x0 = self.roi_info.origin.coordinates
+            height, width = self.roi_info.size.coordinates
+            new_roi = (
+                (old_x + x0) * xbin, width * ybin, xbin,
+                (old_y + y0) * xbin, height * ybin, ybin,
+            )
             self.update_rois(new_roi)
-        elif name == "clear_roi":
-            if value:  # Switching on ROI
-                wdet, hdet = self.controller.get_detector_size()
-                self.settings.child('roi', 'binning').setValue(1)
+            param.setValue(False)
+            param.sigValueChanged.emit(param, False)
+        elif name == 'binning':
+            (x0, w, y0, h, *_) = self.controller.get_roi()
+            b = value
+            self.update_rois((x0, w, b, y0, h, b))
+        elif name == "clear_roi" and value:
+            wdet, hdet = self.controller.get_detector_size()
+            self.settings.child('roi', 'binning').setValue(1)
+            self.update_rois((0, wdet, 1, 0, hdet, 1))
+            param.setValue(False)
+            param.sigValueChanged.emit(param, False)
 
-                new_roi = (0, wdet, 1, 0, hdet, 1)
-                self.update_rois(new_roi)
-                param.setValue(False)
-                param.sigValueChanged.emit(param, False)
+    def grab_data(self, Naverage: int = 1, live: bool = False, **kwargs) -> None:
+        try:
+            self._prepare_view()
+
+            try:
+                frame_rate = self.settings.param('AcquisitionFrameRateAbs').value()
+            except Exception:
+                frame_rate = None
+
+            burst_armed = self.settings.child('burst', 'burst_enable').value()
+            trigger_on = False
+            try:
+                trigger_on = self.settings.child('trigger', 'TriggerMode').value()
+            except Exception:
+                pass
+
+            if burst_armed and trigger_on:
+                self._start_burst(frame_rate)
+            elif live:
+                self.controller.start_grabbing(frame_rate, burst_mode=False)
+            else:
+                self.controller.start_grabbing(frame_rate, burst_mode=False)
+                while not self.controller.imageEventHandler.frame_ready:
+                    pass
+                self.controller.stop_grabbing()
+
+        except Exception as e:
+            self.emit_status(ThreadCommand('Update_Status', [str(e), "log"]))
+
+    def emit_data_callback(self, frame_data: dict) -> None:
+        """Called from pylon's grab thread for every frame."""
+        frame = frame_data['frame']
+        timestamp = frame_data['timestamp']
+
+        if self._burst_active:
+            # hand off immediately, do nothing else
+            self._burst_writer.enqueue(frame.copy(), timestamp)
+            return
+
+        dte = DataToExport(
+            f'{self.user_id}',
+            data=[DataFromPlugins(
+                name=f'{self.user_id}',
+                data=[np.squeeze(frame)],
+                dim=self.data_shape,
+                labels=[f'{self.user_id}_{self.data_shape}'],
+                axes=self.axes,
+            )],
+        )
+        self.dte_signal.emit(dte)
+
+        if self.save_frame:
+            self.handle_metadata_and_saving(frame, timestamp, frame.shape)
+
+        self.metadata = None
+        self.controller.imageEventHandler.frame_ready = False
+
+    def stop(self):
+        if self._burst_active:
+            self._stop_burst()
+        else:
+            self.controller.camera.StopGrabbing()
+        return ''
+
+    def close(self):
+        if self._burst_active:
+            self._stop_burst(wait=True)
+
+        self.controller.attributes = None
+        self.controller.close()
+
+        try:
+            self.stop_temp_monitoring()
+        except Exception:
+            pass
+
+        try:
+            p = self.settings.child('trigger', 'TriggerMode')
+            p.setValue(False)
+            p.sigValueChanged.emit(p, False)
+            p = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
+            p.setValue(False)
+            p.sigValueChanged.emit(p, False)
+        except Exception:
+            pass
+
+        self.status.initialized = False
+        self.status.controller = None
+        self.status.info = ""
+        self.emit_status(ThreadCommand('Update_Status',
+                                       [f"{self.user_id} communication terminated"]))
+
+
+    def _start_burst(self, frame_rate):
+        """Construct the BurstWriter, wire up signals, and start grabbing."""
+        if self._burst_active:
+            self.emit_status(ThreadCommand('Update_Status',
+                                           ["Burst already in progress – ignoring."]))
+            return
+
+        max_frames = self.settings.child('burst', 'burst_stop_group', 'burst_nframes').value()
+        max_seconds = self.settings.child('burst', 'burst_stop_group', 'burst_nseconds').value()
+        if max_frames == 0 and max_seconds == 0.0:
+            self.emit_status(ThreadCommand('Update_Status',
+                                           ["Burst: set Max Frames or Max Seconds first."]))
+            return
+        max_frames = max_frames if max_frames > 0 else None
+        max_seconds = max_seconds if max_seconds > 0.0 else None
+
+        save_dir = self.settings.child('burst', 'burst_path').value()
+        if not save_dir:
+            save_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+        prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"{prefix}_{timestamp_str}.h5"
+        self._burst_h5_path = os.path.join(save_dir, filename)
+
+        (hstart, hend, vstart, vend, xbin, ybin) = self.controller.get_roi()
+        height = hend - hstart
+        width = vend - vstart
+
+        exposure_ms = 0.0
+        gain_val = 0.0
+        for attr_name in self.controller.attribute_names:
+            if 'Exposure' in attr_name and 'Auto' not in attr_name:
+                try:
+                    exposure_ms = self.settings.child('exposure', attr_name).value()
+                except Exception:
+                    pass
+            if 'Gain' in attr_name and 'Auto' not in attr_name:
+                try:
+                    gain_val = self.settings.child('gain', attr_name).value()
+                except Exception:
+                    pass
+
+        camera_meta = {
+            "camera_model": self.controller.model_name,
+            "serial_number": self.controller.device_info.GetSerialNumber(),
+            "exposure_time_ms": exposure_ms,
+            "gain": gain_val,
+            "roi": [hstart, vstart, width, height],
+            "fps_target": frame_rate or 1000,
+        }
+
+        display_nth = self.settings.child(
+            'burst', 'burst_perf_group', 'burst_display_nth'
+        ).value()
+        chunk_size = self.settings.child(
+            'burst', 'burst_perf_group', 'burst_chunk'
+        ).value()
+        queue_size = self.settings.child(
+            'burst', 'burst_perf_group', 'burst_queue_size'
+        ).value()
+        overflow = self.settings.child(
+            'burst', 'burst_perf_group', 'burst_overflow'
+        ).value()
+        drop_oldest = overflow == 'drop_oldest'
+
+        try:
+            pf = self.controller.camera.PixelFormat.GetValue()
+            dtype = np.uint16 if '12' in pf or '16' in pf else np.uint8
+        except Exception:
+            dtype = np.uint16
+
+        self._burst_writer = BurstWriter(
+            h5_path=self._burst_h5_path,
+            frame_shape=(height, width),
+            dtype=dtype,
+            max_frames=max_frames,
+            max_seconds=max_seconds,
+            display_every_nth=display_nth,
+            chunk_size=chunk_size,
+            queue_maxsize=queue_size,
+            drop_oldest=drop_oldest,
+            camera_meta=camera_meta,
+        )
+
+        self._burst_writer.signals.display_frame.connect(self._on_burst_display_frame)
+        self._burst_writer.signals.progress.connect(self._on_burst_progress)
+        self._burst_writer.signals.burst_finished.connect(self._on_burst_finished)
+        self._burst_writer.signals.error.connect(self._on_burst_error)
+
+        self._burst_thread = QtCore.QThread()
+        self._burst_writer.moveToThread(self._burst_thread)
+        self._burst_thread.started.connect(self._burst_writer.run)
+        self._burst_thread.finished.connect(self._burst_thread.deleteLater)
+
+        self._set_burst_status("Recording…")
+        self._set_burst_readouts(0, 0, 0.0)
+
+        self._burst_active = True
+        self._burst_thread.start()
+        self.controller.start_grabbing(frame_rate, burst_mode=True)
+
+        self.emit_status(ThreadCommand('Update_Status',
+                                       [f"Burst started → {self._burst_h5_path}"]))
+
+    def _stop_burst(self, wait: bool = False):
+        """Request the writer to stop and clean up the thread."""
+        if not self._burst_active:
+            return
+
+        # Stop the camera first so no more frames arrive
+        try:
+            self.controller.stop_grabbing()
+        except Exception:
+            pass
+
+        # Signal writer to drain and exit
+        if self._burst_writer is not None:
+            self._burst_writer.request_stop()
+
+        if wait and self._burst_thread is not None:
+            self._burst_thread.quit()
+            self._burst_thread.wait(5000)  # 5 s timeout
+
+        self._burst_active = False
+
+    @QtCore.Slot(object)
+    def _on_burst_display_frame(self, frame: np.ndarray):
+        """Throttled display update during burst – runs in GUI thread."""
+        dte = DataToExport(
+            f'{self.user_id}',
+            data=[DataFromPlugins(
+                name=f'{self.user_id}',
+                data=[np.squeeze(frame)],
+                dim=self.data_shape,
+                labels=[f'{self.user_id}_{self.data_shape}'],
+                axes=self.axes,
+            )],
+        )
+        self.dte_signal.emit(dte)
+
+    @QtCore.Slot(int, int, float)
+    def _on_burst_progress(self, written: int, dropped: int, elapsed: float):
+        """Periodic progress update during burst."""
+        self._set_burst_readouts(written, dropped, elapsed)
+
+    @QtCore.Slot(dict)
+    def _on_burst_finished(self, summary: dict):
+        """Called once the writer thread has finished."""
+        self._burst_active = False
+
+        # Finalize thread
+        if self._burst_thread is not None:
+            self._burst_thread.quit()
+            self._burst_thread.wait()
+            self._burst_thread = None
+        self._burst_writer = None
+
+        # Update GUI
+        self._set_burst_readouts(
+            summary['frames_written'],
+            summary['frames_dropped'],
+            summary['elapsed_seconds'],
+        )
+        drop_pct = summary['drop_rate_pct']
+        status_msg = (
+            f"Done – {summary['frames_written']} frames, "
+            f"{drop_pct:.1f}% dropped, "
+            f"{summary['actual_fps']:.1f} fps"
+        )
+        self._set_burst_status(status_msg)
+
+        # Reset arm button
+        p = self.settings.child('burst', 'burst_enable')
+        p.setValue(False)
+        p.sigValueChanged.emit(p, False)
+
+        self.emit_status(ThreadCommand('Update_Status', [status_msg]))
+
+        # Publish LECO end-of-burst summary
+        self._publish_burst_summary(summary)
+
+    @QtCore.Slot(str)
+    def _on_burst_error(self, msg: str):
+        self._burst_active = False
+        self._set_burst_status(f"ERROR: {msg}")
+        self.emit_status(ThreadCommand('Update_Status', [f"Burst error: {msg}", "log"]))
+
+
+    def _set_burst_status(self, text: str):
+        p = self.settings.child('burst', 'burst_status')
+        p.setValue(text)
+        p.sigValueChanged.emit(p, text)
+
+    def _set_burst_readouts(self, written: int, dropped: int, elapsed: float):
+        for name, val in (
+            ('burst_written', written),
+            ('burst_dropped', dropped),
+            ('burst_elapsed', round(elapsed, 2)),
+        ):
+            p = self.settings.child('burst', name)
+            p.setValue(val)
+            p.sigValueChanged.emit(p, val)
+
+ 
+    def _publish_burst_summary(self, summary: dict):
+        """Publish a single end-of-burst LECO message."""
+        if self.data_publisher is None:
+            return
+        try:
+            publisher_name = self.settings.child('leco_log', 'publisher_name').value()
+            payload = {
+                publisher_name: {
+                    **summary,
+                    "user_id": self.user_id,
+                    "h5_path": self._burst_h5_path,
+                }
+            }
+            self.data_publisher.send_data2(payload)
+        except Exception as e:
+            self.emit_status(ThreadCommand('Update_Status',
+                                           [f"LECO burst publish failed: {e}"]))
+
+    def handle_metadata_and_saving(self, frame, timestamp, shape):
+        if not self.settings.child('trigger', 'TriggerMode').value():
+            return
+        metadata = self.get_metadata_and_save(frame, timestamp, shape)
+        if self.send_frame_leco:
+            self.publish_metadata(metadata, frame)
+        else:
+            self.publish_metadata(metadata)
+
+    def get_metadata_and_save(self, frame, timestamp, shape):
+        index = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSaveIndex')
+        filetype = self.settings.child('trigger', 'TriggerSaveOptions', 'Filetype').value()
+        if self.metadata is not None:
+            metadata = self.metadata
+            filepath = self.metadata['file_metadata']['filepath']
+            filename = self.metadata['file_metadata']['filename']
+            self.metadata['burst_metadata']['user_id'] = self.user_id
+            basepath = self.settings.child('leco_log', 'leco_basepath').value()
+            filepath = os.path.normpath(
+                os.path.join(basepath, filepath.lstrip(os.path.sep))
+            )
+        else:
+            filepath = self.settings.child(
+                'trigger', 'TriggerSaveOptions', 'TriggerSaveLocation'
+            ).value()
+            prefix = self.settings.child('trigger', 'TriggerSaveOptions', 'Prefix').value()
+            if not filepath:
+                filepath = os.path.join(os.path.expanduser('~'), 'Downloads')
+            filename = f"{prefix}{index.value()}.{filetype}"
+            metadata = {'burst_metadata': {}, 'file_metadata': {}, 'detector_metadata': {}}
+            metadata['burst_metadata']['uuid'] = str(uuid7())
+            metadata['burst_metadata']['user_id'] = self.user_id
+            metadata['burst_metadata']['timestamp'] = timestamp
+            metadata['file_metadata']['filepath'] = filepath
+            metadata['file_metadata']['filename'] = filename
+            index.setValue(index.value() + 1)
+            index.sigValueChanged.emit(index, index.value())
+
+        metadata['detector_metadata']['fuzziness'] = 0.1
+        count = 0
+        for name in self.controller.attribute_names:
+            if 'Gain' in name and 'Auto' not in name:
+                metadata['detector_metadata']['gain'] = self.settings.child('gain', name).value()
+                count += 1
+            if 'Exposure' in name and 'Auto' not in name:
+                metadata['detector_metadata']['exposure_time'] = self.settings.child(
+                    'exposure', name
+                ).value()
+                count += 1
+            if count == 2:
+                break
+        metadata['detector_metadata']['shape'] = shape
+
+        if filetype == 'h5':
+            fname = filename if filename.endswith('.h5') else filename + '.h5'
+            full_path = os.path.join(filepath, fname)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with h5py.File(full_path, 'w') as f:
+                f.create_dataset(f"frame_{timestamp}", data=frame)
+                for k, v in {
+                    'uuid': metadata['burst_metadata']['uuid'],
+                    'user_id': metadata['burst_metadata']['user_id'],
+                    'timestamp': timestamp,
+                    'exposure_time': metadata['detector_metadata']['exposure_time'],
+                    'gain': metadata['detector_metadata']['gain'],
+                    'shape': metadata['detector_metadata']['shape'],
+                    'fuzziness': metadata['detector_metadata']['fuzziness'],
+                    'format_version': 'hdf5-v0.1',
+                }.items():
+                    f.attrs[k] = v
+        else:
+            if filetype not in ['png', 'jpg', 'jpeg', 'tiff', 'tif']:
+                self.emit_status(ThreadCommand('Update_Status',
+                                               [f"Unsupported file type: {filetype}"]))
+                return metadata
+            fname = filename if filename.endswith(f'.{filetype}') else filename + f'.{filetype}'
+            full_path = os.path.join(filepath, fname)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            iio.imwrite(full_path, frame)
+
+        return metadata
+
+    def publish_metadata(self, metadata, frame: Optional[np.ndarray] = None):
+        if self.data_publisher is not None and self.save_frame:
+            publisher_name = self.settings.child('leco_log', 'publisher_name').value()
+            if self.send_frame_leco and frame is not None:
+                self.data_publisher.send_data2({publisher_name: {
+                    'frame': frame, 'metadata': metadata,
+                    'message_type': 'detector',
+                    'serial_number': self.controller.device_info.GetSerialNumber(),
+                    'format_version': 'hdf5-v0.1',
+                }})
+            else:
+                self.data_publisher.send_data2({publisher_name: {
+                    'metadata': metadata,
+                    'message_type': 'detector',
+                    'serial_number': self.controller.device_info.GetSerialNumber(),
+                    'format_version': 'hdf5-v0.1',
+                }})
 
 
     def _prepare_view(self):
-        """Preparing a data viewer by emitting temporary data. Typically, needs to be called whenever the
-        ROIs are changed"""
- 
         (hstart, hend, vstart, vend, *binning) = self.controller.get_roi()
         try:
-           xbin, ybin = binning
-        except ValueError:  # some Pylablib `get_roi` do return just four values instead of six
-           xbin = ybin = 1
+            xbin, ybin = binning
+        except ValueError:
+            xbin = ybin = 1
         height = hend - hstart
         width = vend - vstart
- 
+
         self.settings.child('roi', 'width').setValue(width)
         self.settings.child('roi', 'height').setValue(height)
 
         mock_data = np.zeros((height, width))
-
         self.x_axis = Axis(label='Pixels', data=np.linspace(1, width, width), index=1)
 
         if width != 1 and height != 1:
@@ -375,217 +791,53 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         if data_shape != self.data_shape:
             self.data_shape = data_shape
             self.dte_signal_temp.emit(
-                DataToExport(f'{self.user_id}',
-                            data=[DataFromPlugins(name=f'{self.user_id}',
-                                                    data=[np.squeeze(mock_data)],
-                                                    dim=self.data_shape,
-                                                    labels=[f'{self.user_id}_{self.data_shape}'],
-                                                    axes=self.axes)]))
-
+                DataToExport(
+                    f'{self.user_id}',
+                    data=[DataFromPlugins(
+                        name=f'{self.user_id}',
+                        data=[np.squeeze(mock_data)],
+                        dim=self.data_shape,
+                        labels=[f'{self.user_id}_{self.data_shape}'],
+                        axes=self.axes,
+                    )],
+                )
+            )
             QtWidgets.QApplication.processEvents()
 
     def update_rois(self, new_roi):
         (new_x, new_width, new_xbinning, new_y, new_height, new_ybinning) = new_roi
         if new_roi != self.controller.get_roi():
-            # self.controller.set_attribute_value("ROIs",[new_roi])
-            self.controller.set_roi(hstart=new_x,
-                                    hend=new_x + new_width,
-                                    vstart=new_y,
-                                    vend=new_y + new_height,
-                                    hbin=new_xbinning,
-                                    vbin=new_ybinning)
+            self.controller.set_roi(
+                hstart=new_x, hend=new_x + new_width,
+                vstart=new_y, vend=new_y + new_height,
+                hbin=new_xbinning, vbin=new_ybinning,
+            )
             self.emit_status(ThreadCommand('Update_Status', [f'Changed ROI: {new_roi}']))
             self.controller.clear_acquisition()
             self.controller.setup_acquisition()
-            # Finally, prepare view for displaying the new data
             self._prepare_view()
 
-    def grab_data(self, Naverage: int = 1, live: bool = False, **kwargs) -> None:
-        try:
-            self._prepare_view()
-            if "Acquisition Frame Rate" in self.controller.attributes:
-                frame_rate = self.settings.param('AcquisitionFrameRateAbs').value()
-            else:
-                frame_rate = None            
-            if live:
-                self.controller.start_grabbing(frame_rate)
-            else:
-                self.controller.start_grabbing(frame_rate)
-                while not self.controller.imageEventHandler.frame_ready:
-                    pass # do nothing until a frame is ready
-                self.controller.stop_grabbing()
-        except Exception as e:
-            self.emit_status(ThreadCommand('Update_Status', [str(e), "log"]))
-
-
-    def emit_data_callback(self, frame_data: dict) -> None:
-        frame = frame_data['frame']
-        timestamp = frame_data['timestamp']
-        shape = frame.shape
-        # First emit data to the GUI
-        dte = DataToExport(f'{self.user_id}', data=[DataFromPlugins(
-            name=f'{self.user_id}',
-            data=[np.squeeze(frame)],
-            dim=self.data_shape,
-            labels=[f'{self.user_id}_{self.data_shape}'],
-            axes=self.axes)])
-        self.dte_signal.emit(dte)
-
-        # Now, handle data saving with filepath given by user in trigger save settings or from metadata set remotely with LECO
-        if self.save_frame:
-            self.handle_metadata_and_saving(frame, timestamp, shape)
-
-        # Prepare for next frame
-        self.metadata = None
-        self.controller.imageEventHandler.frame_ready = False
-
-    def handle_metadata_and_saving(self, frame, timestamp, shape):
-        if not self.settings.child('trigger', 'TriggerMode').value():
-            return
-        metadata = self.get_metadata_and_save(frame, timestamp, shape)
-        if self.send_frame_leco:
-            self.publish_metadata(metadata, frame)
-        else:
-            self.publish_metadata(metadata)
-
-    def stop(self):
-        self.controller.camera.StopGrabbing()
-        return ''
-    
-    def close(self):
-        """Terminate the communication protocol"""
-        self.controller.attributes = None
-        self.controller.close()
-            
-        # Stop any background threads
-        try:
-            self.stop_temp_monitoring()
-        except Exception:
-            pass # no temp settings
-
-        # Just set these to false if camera disconnected for clean GUI
-        try:
-            param = self.settings.child('trigger', 'TriggerMode')
-            param.setValue(False) # Turn off save on trigger if triggering is off
-            param.sigValueChanged.emit(param, False)
-            param = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
-            param.setValue(False) # Turn off save on trigger if triggering is off
-            param.sigValueChanged.emit(param, False) 
-        except Exception:
-            pass # no trigger settings
-
-        self.status.initialized = False
-        self.status.controller = None
-        self.status.info = ""
-        print(f"{self.user_id} communication terminated successfully")
-        self.emit_status(ThreadCommand('Update_Status', [f"{self.user_id} communication terminated successfully"]))
-
-    def get_metadata_and_save(self, frame, timestamp, shape):
-        if self.save_frame:
-            index = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSaveIndex')
-            filetype = self.settings.child('trigger', 'TriggerSaveOptions', 'Filetype').value()
-            if self.metadata is not None:
-                metadata = self.metadata
-                filepath = self.metadata['file_metadata']['filepath']
-                filename = self.metadata['file_metadata']['filename']
-                self.metadata['burst_metadata']['user_id'] = self.user_id
-                basepath = self.settings.child('leco_log', 'leco_basepath').value()
-                filepath = os.path.normpath(os.path.join(basepath, filepath.lstrip(os.path.sep)))
-            else:
-                filepath = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSaveLocation').value()
-                prefix = self.settings.child('trigger', 'TriggerSaveOptions', 'Prefix').value()
-                if not filepath:
-                    filepath = os.path.join(os.path.expanduser('~'), 'Downloads')
-                filename = f"{prefix}{index.value()}.{filetype}"
-                metadata = {'burst_metadata':{}, 'file_metadata': {}, 'detector_metadata': {}}
-                metadata['burst_metadata']['uuid'] = str(uuid7())
-                metadata['burst_metadata']['user_id'] = self.user_id
-                metadata['burst_metadata']['timestamp'] = timestamp
-                metadata['file_metadata']['filepath'] = filepath
-                metadata['file_metadata']['filename'] = filename
-                index.setValue(index.value()+1)
-                index.sigValueChanged.emit(index, index.value())
-
-            metadata['detector_metadata']['fuzziness'] = 0.1 # Account for some uncertainty in timestamp of frame, assume ~100 us for now
-            count = 0
-            for name in self.controller.attribute_names:
-                if 'Gain' in name and 'Auto' not in name:
-                    metadata['detector_metadata']['gain'] = self.settings.child('gain', name).value()
-                    count += 1
-                if 'Exposure' in name and 'Auto' not in name:
-                    metadata['detector_metadata']['exposure_time'] = self.settings.child('exposure', name).value()
-                    count += 1
-                if count == 2:
-                    break
-            metadata['detector_metadata']['shape'] = shape
-            if filetype == 'h5':
-                if not filename.endswith('.h5'):
-                    filename += '.h5'
-                full_path = os.path.join(filepath, filename)
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                with h5py.File(full_path, 'w') as f:
-                    dataset_name = f"frame_{timestamp}"
-                    f.create_dataset(dataset_name, data=frame)
-                    f.attrs['uuid'] = metadata['burst_metadata']['uuid']
-                    f.attrs['user_id'] = metadata['burst_metadata']['user_id']
-                    f.attrs['timestamp'] = timestamp
-                    f.attrs['exposure_time'] = metadata['detector_metadata']['exposure_time']
-                    f.attrs['gain'] = metadata['detector_metadata']['gain']
-                    f.attrs['shape'] = metadata['detector_metadata']['shape']
-                    f.attrs['fuzziness'] = metadata['detector_metadata']['fuzziness']
-                    f.attrs['format_version'] = 'hdf5-v0.1'
-            else:
-                if not filename.endswith(f".{filetype}"):
-                    filename += f".{filetype}"
-                if filetype not in ['png', 'jpg', 'jpeg', 'tiff', 'tif']:
-                    print(f"Unsupported file type {filetype} for saving frame. Supported types are: png, jpg, jpeg, tiff, tif, h5")
-                    self.emit_status(ThreadCommand('Update_Status', [f"Unsupported file type {filetype} for saving frame. Supported types are: png, jpg, jpeg, tiff, tif, h5"]))
-                    return
-                full_path = os.path.join(filepath, f"{filename}")
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                iio.imwrite(full_path, frame)
-        return metadata
-
-    def publish_metadata(self, metadata, frame: Optional[np.ndarray] = None):
-        if self.data_publisher is not None and self.save_frame:
-            if self.send_frame_leco:                        
-                self.data_publisher.send_data2({self.settings.child('leco_log', 'publisher_name').value(): 
-                                                {'frame': frame, 'metadata': metadata, 
-                                                 'message_type': 'detector', 
-                                                 'serial_number': self.controller.device_info.GetSerialNumber(),
-                                                 'format_version': 'hdf5-v0.1'}})
-            else:
-                self.data_publisher.send_data2({self.settings.child('leco_log', 'publisher_name').value(): 
-                                                {'metadata': metadata, 
-                                                 'message_type': 'detector',
-                                                 'serial_number': self.controller.device_info.GetSerialNumber(),
-                                                 'format_version': 'hdf5-v0.1'}})
-    
     def roi_select(self, roi_info, ind_viewer):
         self.roi_info = roi_info
-    
+
     def crosshair(self, crosshair_info, ind_viewer=0):
         self.crosshair_info = crosshair_info
-        # Adding a small delay improves performance 
         QtCore.QTimer.singleShot(200, QtWidgets.QApplication.processEvents)
 
     def camera_lost(self):
         self.close()
-        print(f"Lost connection to {self.user_id}")
-        self.emit_status(ThreadCommand('Update_Status', [f"Lost connection to {self.user_id}"]))
+        self.emit_status(ThreadCommand('Update_Status',
+                                       [f"Lost connection to {self.user_id}"]))
 
     def start_temperature_monitoring(self):
         self.temp_thread = QtCore.QThread()
         self.temp_worker = TemperatureMonitor(self.controller.camera)
-
         self.temp_worker.moveToThread(self.temp_thread)
-
         self.temp_thread.started.connect(self.temp_worker.run)
         self.temp_worker.temperature_updated.connect(self.on_temperature_update)
         self.temp_worker.finished.connect(self.temp_thread.quit)
         self.temp_worker.finished.connect(self.temp_worker.deleteLater)
         self.temp_thread.finished.connect(self.temp_thread.deleteLater)
-
         self.temp_thread.start()
 
     def stop_temp_monitoring(self):
@@ -597,26 +849,22 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                 self.temp_thread.quit()
                 self.temp_thread.wait()
             except RuntimeError:
-                pass  # Already deleted
+                pass
             self.temp_thread = None
-        # Make sure temp. monitoring param is false in GUI
-        param = self.settings.child('temperature', 'TemperatureMonitor')
-        param.setValue(False)
-        param.sigValueChanged.emit(param, param.value())
+        p = self.settings.child('temperature', 'TemperatureMonitor')
+        p.setValue(False)
+        p.sigValueChanged.emit(p, p.value())
 
     def on_temperature_update(self, temp: float):
-        param = self.settings.child('temperature', 'TemperatureAbs')
-        param.setValue(temp)
-        param.sigValueChanged.emit(param, temp)
-        # TODO maybe close device here if temperature is too high, and allow user to set this threshold ?
+        p = self.settings.child('temperature', 'TemperatureAbs')
+        p.setValue(temp)
+        p.sigValueChanged.emit(p, temp)
         if temp > 60:
-            self.emit_status(ThreadCommand('Update_Status', [f"WARNING: {self.user_id} camera is hot !!"]))
+            self.emit_status(ThreadCommand('Update_Status',
+                                           [f"WARNING: {self.user_id} camera is hot!!"]))
 
-
-    # This will add self.attributes, which is derived from the model config file, to self.settings
     def add_attributes_to_settings(self):
         existing_group_names = {child.name() for child in self.settings.children()}
-
         for attr in self.controller.attributes:
             attr_name = attr['name']
             if attr.get('type') == 'group':
@@ -624,125 +872,92 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                     self.settings.addChild(attr)
                 else:
                     group_param = self.settings.child(attr_name)
-
-                    existing_children = {child.name(): child for child in group_param.children()}
-
-                    expected_children = attr.get('children', [])
-                    for expected in expected_children:
+                    existing_children = {c.name(): c for c in group_param.children()}
+                    for expected in attr.get('children', []):
                         expected_name = expected['name']
                         if expected_name not in existing_children:
                             for old_name, old_child in existing_children.items():
-                                if old_child.opts.get('title') == expected.get('title') and old_name != expected_name:
+                                if (old_child.opts.get('title') == expected.get('title')
+                                        and old_name != expected_name):
                                     self.settings.child(attr_name, old_name).show(False)
                                     break
-
                             group_param.addChild(expected)
             else:
                 if attr_name not in existing_group_names:
                     self.settings.addChild(attr)
-        
-    # This will ensure that the UI shows the current camera parameters values and limits
+
     def update_params_ui(self):
-
-        # Common syntax for any camera model
-        param = self.settings.child('device_info','DeviceModelName').setValue(self.controller.model_name)
-        self.settings.child('device_info','DeviceSerialNumber').setValue(self.controller.device_info.GetSerialNumber())
-        self.settings.child('device_info','DeviceVersion').setValue(self.controller.device_info.GetDeviceVersion())
-        self.settings.child('device_info','DeviceUserID').setValue(self.controller.device_info.GetFriendlyName())
-
+        self.settings.child('device_info', 'DeviceModelName').setValue(
+            self.controller.model_name
+        )
+        self.settings.child('device_info', 'DeviceSerialNumber').setValue(
+            self.controller.device_info.GetSerialNumber()
+        )
+        self.settings.child('device_info', 'DeviceVersion').setValue(
+            self.controller.device_info.GetDeviceVersion()
+        )
+        self.settings.child('device_info', 'DeviceUserID').setValue(
+            self.controller.device_info.GetFriendlyName()
+        )
 
         for param in self.controller.attributes:
             param_type = param['type']
             param_name = param['name']
-            
-            # Already handled
-            if param_name == "device_info":
-                continue
-            if param_name == "device_state":
-                continue
-            if param_name == "temperature":
+
+            if param_name in ("device_info", "device_state", "temperature"):
                 continue
 
             if param_type == 'group':
-                # Recurse over children in groups
                 for child in param['children']:
                     child_name = child['name']
                     child_type = child['type']
-                    # Special case: skip these
                     if child_name == 'TriggerSaveOptions':
                         continue
-
-                    camera_attr = getattr(self.controller.camera, child_name)
-
+                    camera_attr = getattr(self.controller.camera, child_name, None)
+                    if camera_attr is None:
+                        continue
                     try:
                         if child_type in ['float', 'slide', 'int', 'str']:
                             value = camera_attr.GetValue()
                         elif child_type == 'led_push':
-                            if child_name != 'GammaEnable':
-                                value = bool(camera_attr.GetIntValue())
-                            else:
-                                value = camera_attr.GetValue()
+                            value = (camera_attr.GetValue() if child_name == 'GammaEnable'
+                                     else bool(camera_attr.GetIntValue()))
                         else:
-                            continue  # Unsupported type, skip
-
-                        # Special case: if parameter is related to ExposureTime, convert to ms from us
+                            continue
                         if 'Exposure' in child_name and 'Auto' not in child_name:
                             value *= 1e-3
-
-                        # Set the value
                         self.settings.child(param_name, child_name).setValue(value)
-
-                        # Set limits if defined
-                        if 'limits' in child and child_type in ['float', 'slide', 'int'] and not child.get('readonly', False):
-                            try:
-                                min_limit = camera_attr.GetMin()
-                                max_limit = camera_attr.GetMax()
-
-                                if 'Exposure' in child_name and 'Auto' not in child_name:
-                                    min_limit *= 1e-3
-                                    max_limit *= 1e-3
-
-                                self.settings.child(param_name, child_name).setLimits([min_limit, max_limit])
-                            except Exception:
-                                pass
-
+                        if ('limits' in child and child_type in ['float', 'slide', 'int']
+                                and not child.get('readonly', False)):
+                            mn, mx = camera_attr.GetMin(), camera_attr.GetMax()
+                            if 'Exposure' in child_name and 'Auto' not in child_name:
+                                mn *= 1e-3
+                                mx *= 1e-3
+                            self.settings.child(param_name, child_name).setLimits([mn, mx])
                     except Exception:
                         pass
             else:
-                camera_attr = getattr(self.controller.camera, param_name)
+                camera_attr = getattr(self.controller.camera, param_name, None)
+                if camera_attr is None:
+                    continue
                 try:
                     if param_type in ['float', 'slide', 'int', 'str']:
                         value = camera_attr.GetValue()
                     elif param_type == 'led_push':
-                        if param_name != 'GammaEnable':
-                            value = bool(camera_attr.GetIntValue())
-                        else:
-                            value = camera_attr.GetValue()
+                        value = (camera_attr.GetValue() if param_name == 'GammaEnable'
+                                 else bool(camera_attr.GetIntValue()))
                     else:
-                        continue  # Unsupported type, skip
-
-                    # Special case: if parameter is related to ExposureTime, convert to ms from us
+                        continue
                     if 'Exposure' in param_name and 'Auto' not in param_name:
                         value *= 1e-3
-
-                    # Set the value
                     self.settings.param(param_name).setValue(value)
-
-                    if 'limits' in param and param_type in ['float', 'slide', 'int'] and not param.get('readonly', False):
-                        try:
-                            min_limit = camera_attr.GetMin()
-                            max_limit = camera_attr.GetMax()
-
-
-                            if 'Exposure' in param_name and 'Auto' not in param_name:
-                                min_limit *= 1e-3
-                                max_limit *= 1e-3
-
-                            self.settings.param(param_name).setLimits([min_limit, max_limit])
-
-                        except Exception:
-                            pass
-
+                    if ('limits' in param and param_type in ['float', 'slide', 'int']
+                            and not param.get('readonly', False)):
+                        mn, mx = camera_attr.GetMin(), camera_attr.GetMax()
+                        if 'Exposure' in param_name and 'Auto' not in param_name:
+                            mn *= 1e-3
+                            mx *= 1e-3
+                        self.settings.param(param_name).setLimits([mn, mx])
                 except Exception:
                     pass
 

@@ -111,5 +111,7 @@ venv.bak/
 .idea/
 .idea/*
 
+.vscode/
+
 *yacctab.py
 *lextab.py

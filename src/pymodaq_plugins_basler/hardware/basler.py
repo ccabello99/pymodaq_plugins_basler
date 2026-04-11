@@ -38,13 +38,21 @@ if sys.platform.startswith("win"):
         return ctypes.windll.user32.MessageBoxW(0, text, title, flags)
 
 
+# Number of pylon internal buffers allocated during normal operation.
+_NORMAL_BUFFER_COUNT = 10
+
+# Number of pylon internal buffers allocated during burst mode.
+# Increase this if you see "Buffer underrun" errors from pylon at 1 kHz.
+_BURST_BUFFER_COUNT = 200
+
+
 class BaslerCamera:
     """Control a Basler camera in the style of pylablib.
 
     It wraps an :class:`pylon.InstantCamera` instance.
 
-    :param name: Full name of the device.
-    :param callback: Callback method for each grabbed image
+    :param info: Device info object from :meth:`list_cameras`.
+    :param callback: Callback method for each grabbed image.
     """
 
     tlFactory: pylon.TlFactory
@@ -52,36 +60,35 @@ class BaslerCamera:
 
     def __init__(self, info: str, callback: Optional[Callable] = None, **kwargs):
         super().__init__(**kwargs)
-        # create camera object
         self.tlFactory = pylon.TlFactory.GetInstance()
         self.camera = pylon.InstantCamera()
         self.model_name = info.GetModelName()
         self.device_info = info
         self._msg_opener = None
 
-        # Default directory for parameter config files
         if platform.system() == 'Windows':
             self.base_dir = os.path.join(os.environ.get('PROGRAMDATA'), '.pymodaq')
         else:
-            self.base_dir = '/etc/.pymodaq'        
+            self.base_dir = '/etc/.pymodaq'
 
-        # Default place to look for saved device state configuration
-        self.default_device_state_path = os.path.join(self.base_dir, f'{self.model_name}_config.pfs')
+        self.default_device_state_path = os.path.join(
+            self.base_dir, f'{self.model_name}_config.pfs'
+        )
 
-        # register configuration event handler
         self.configurationEventHandler = ConfigurationHandler()
         self.camera.RegisterConfiguration(
             self.configurationEventHandler,
             pylon.RegistrationMode_ReplaceAll,
             pylon.Cleanup_None,
         )
-        # configure camera events
         self.imageEventHandler = ImageEventHandler()
         self.camera.RegisterImageEventHandler(
             self.imageEventHandler, pylon.RegistrationMode_Append, pylon.Cleanup_None
         )
 
-        self.imageEventHandler.signals.imageGrabbed.connect(lambda x: print("Image grabbed"))
+        self.imageEventHandler.signals.imageGrabbed.connect(
+            lambda x: print("Image grabbed")
+        )
 
         self.attributes = {}
         self.open()
@@ -99,47 +106,46 @@ class BaslerCamera:
             raise
         self.create_default_config_if_not_exists()
         self.get_attributes()
-        self.attribute_names = [attr['name'] for attr in self.attributes] + [child['name'] for attr in self.attributes if attr.get('type') == 'group' for child in attr.get('children', [])]
+        self.attribute_names = (
+            [attr['name'] for attr in self.attributes]
+            + [
+                child['name']
+                for attr in self.attributes
+                if attr.get('type') == 'group'
+                for child in attr.get('children', [])
+            ]
+        )
 
     def set_callback(
         self, callback: Callable[[NDArray], None], replace_all: bool = True
     ) -> None:
-        """Setup a callback method for continuous acquisition.
-
-        :param callback: Method to be used in continuous mode. It should accept an array as input.
-        :param bool replace_all: Whether to remove all previously set callback methods.
-        """
+        """Setup a callback method for continuous acquisition."""
         if replace_all:
             try:
                 self.imageEventHandler.signals.imageGrabbed.disconnect()
             except TypeError:
-                pass  # not connected
+                pass
         self.imageEventHandler.signals.imageGrabbed.connect(callback)
 
-    # Methods in the style of pylablib
     @staticmethod
     def list_cameras() -> List[pylon.InstantCamera]:
         """List all available cameras as camera info objects."""
         tlFactory = pylon.TlFactory.GetInstance()
         return tlFactory.EnumerateDevices()
-    
 
     def get_attributes(self):
         """Get the attributes of the camera and store them in a dictionary."""
         name = self.model_name.replace(" ", "-")
-
         file_path = os.path.join(self.base_dir, f'config_{name}.json')
-
-        try:        
+        try:
             with open(file_path, 'r') as file:
                 attributes = json.load(file)
                 self.attributes = self.clean_device_attributes(attributes)
         except Exception as e:
-            logger.error(f"The config file was not found at {file_path}: ", e, " Make sure to add it !")
-
+            logger.error(f"The config file was not found at {file_path}: {e}")
 
     def get_roi(self) -> Tuple[float, float, float, float, int, int]:
-        """Return x0, width, y0, height, xbin, ybin."""
+        """Return x0, x0+width, y0, y0+height, xbin, ybin."""
         x0 = self.camera.OffsetX.GetValue()
         width = self.camera.Width.GetValue()
         y0 = self.camera.OffsetY.GetValue()
@@ -153,10 +159,9 @@ class BaslerCamera:
     ) -> None:
         camera = self.camera
         m_width, m_height = self.get_detector_size()
-        inc = camera.Width.Inc  # minimum step size
+        inc = camera.Width.Inc
         hstart = detector_clamp(hstart, m_width) // inc * inc
         vstart = detector_clamp(vstart, m_height) // inc * inc
-        # Set the offset to 0 first, to allow full range of width values.
         camera.OffsetX.SetValue(0)
         camera.Width.SetValue((detector_clamp(hend, m_width) - hstart) // inc * inc)
         camera.OffsetX.SetValue(hstart)
@@ -171,7 +176,7 @@ class BaslerCamera:
         return self.camera.SensorWidth.GetValue(), self.camera.SensorHeight.GetValue()
 
     def get_attribute_value(self, name, error_on_missing=True):
-        """Get the camera attribute with the given name"""
+        """Get the camera attribute with the given name."""
         return self.attributes[name]
 
     def setup_acquisition(self):
@@ -184,25 +189,52 @@ class BaslerCamera:
             self.camera.AcquisitionMode.SetValue("Continuous")
             self.camera.AcquisitionFrameRateEnable.SetValue(True)
         except Exception as e:
-            logger.error(f"Could not properly setup acquisition for live grabbing.", e)
+            logger.error(f"Could not properly setup acquisition for live grabbing: {e}")
 
     def close(self) -> None:
         self.camera.Close()
         self.camera.DetachDevice()
 
-    def start_grabbing(self, frame_rate: int) -> None:
-        """Start continuously to grab data.
+    def start_grabbing(self, frame_rate: Optional[int], burst_mode: bool = False) -> None:
+        """Start continuously grabbing frames.
 
-        Whenever a grab succeeded, the callback defined in :meth:`set_callback` is called.
+        Parameters
+        ----------
+        frame_rate:
+            Target frame rate.  Passed to ``AcquisitionFrameRate``.
+        burst_mode:
+            When True, switches to ``GrabStrategy_OneByOne`` and raises the
+            pylon internal buffer count so that no frames are dropped at the
+            pylon layer.  Use this for high-speed (≥ 1 kHz) recording.
+            When False (default), uses ``GrabStrategy_LatestImageOnly`` which
+            is fine for live display but silently discards frames under load.
         """
         if frame_rate is not None:
             try:
                 self.camera.AcquisitionFrameRate.SetValue(frame_rate)
             except pylon.LogicalErrorException:
                 pass
-        self.camera.StartGrabbing(
-            pylon.GrabStrategy_LatestImageOnly, pylon.GrabLoop_ProvidedByInstantCamera
-        )
+
+        if burst_mode:
+            # Raise pylon's internal ring buffer so the camera keeps
+            # delivering even if the writer thread stalls briefly.
+            try:
+                self.camera.MaxNumBuffer.SetValue(_BURST_BUFFER_COUNT)
+            except Exception:
+                pass  # not all models expose this node
+            self.camera.StartGrabbing(
+                pylon.GrabStrategy_OneByOne,
+                pylon.GrabLoop_ProvidedByInstantCamera,
+            )
+        else:
+            try:
+                self.camera.MaxNumBuffer.SetValue(_NORMAL_BUFFER_COUNT)
+            except Exception:
+                pass
+            self.camera.StartGrabbing(
+                pylon.GrabStrategy_LatestImageOnly,
+                pylon.GrabLoop_ProvidedByInstantCamera,
+            )
 
     def stop_grabbing(self):
         self.camera.StopGrabbing()
@@ -229,24 +261,19 @@ class BaslerCamera:
         else:
             print("No saved settings file found to load.")
 
-    
     def clean_device_attributes(self, attributes):
         clean_params = []
-
-        # Check if attributes is a list or dictionary
         if isinstance(attributes, dict):
             items = attributes.items()
         elif isinstance(attributes, list):
-            # If it's a list, we assume each item is a parameter (no keys)
-            items = enumerate(attributes)  # Use index for 'key'
+            items = enumerate(attributes)
         else:
             raise ValueError(f"Unsupported type for attributes: {type(attributes)}")
 
         for idx, attr in items:
             param = {}
-
             param['title'] = attr.get('title', '')
-            param['name'] = attr.get('name', str(idx))  # use index if name is missing
+            param['name'] = attr.get('name', str(idx))
             param['type'] = attr.get('type', 'str')
             param['value'] = attr.get('value', '')
             param['default'] = attr.get('default', None)
@@ -255,21 +282,18 @@ class BaslerCamera:
 
             if param['type'] == 'group' and 'children' in attr:
                 children = attr['children']
-                # If children is a dict, convert to a list
                 if isinstance(children, dict):
                     children = list(children.values())
                 param['children'] = self.clean_device_attributes(children)
 
             clean_params.append(param)
-
         return clean_params
-    
+
     def check_attribute_names(self):
         found_exposure = None
         found_gain = None
 
-        possible_exposures = ["ExposureTime", "ExposureTimeAbs", "ExposureTimeRaw"]
-        for exp in possible_exposures:
+        for exp in ["ExposureTime", "ExposureTimeAbs", "ExposureTimeRaw"]:
             try:
                 if hasattr(self.camera, exp):
                     found_exposure = exp
@@ -277,25 +301,19 @@ class BaslerCamera:
             except pylon.LogicalErrorException:
                 pass
 
-        possible_gains = ["Gain", "GainRaw", "GainAll"]
         raw_gain = False
-        for gain in possible_gains:
+        for gain in ["Gain", "GainRaw", "GainAll"]:
             try:
                 if hasattr(self.camera, gain):
                     found_gain = gain
-
                     if gain == "GainRaw":
                         raw_gain = True
                     break
             except pylon.LogicalErrorException:
                 pass
 
-        found_exposure = found_exposure or "ExposureTime"
-        found_gain = found_gain or "Gain"
+        return found_exposure or "ExposureTime", found_gain or "Gain", raw_gain
 
-        return found_exposure, found_gain, raw_gain
-
-    
     def create_default_config_if_not_exists(self):
         model_name = self.model_name.replace(" ", "-")
         config_dir = self.base_dir
@@ -303,84 +321,55 @@ class BaslerCamera:
         config_path = os.path.join(config_dir, f'config_{model_name}.json')
         if os.path.exists(config_path):
             return
-        else:
-            self._msg_opener = DefaultConfigMsg()
-            msg = QtWidgets.QMessageBox()
-            msg.setIcon(QtWidgets.QMessageBox.Question)
-            msg.setWindowTitle("Missing Config File")
-            msg.setText(f"No config file found for camera model '{model_name}'.")
-            msg.setInformativeText("Would you like to auto-create a default configuration file?")
-            msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-            msg.setDefaultButton(QtWidgets.QMessageBox.Yes)
-            QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
-            user_choice = self.safe_exec_messagebox(msg)
-            self.handle_user_choice(user_choice, config_path, model_name)
+
+        self._msg_opener = DefaultConfigMsg()
+        msg = QtWidgets.QMessageBox()
+        msg.setIcon(QtWidgets.QMessageBox.Question)
+        msg.setWindowTitle("Missing Config File")
+        msg.setText(f"No config file found for camera model '{model_name}'.")
+        msg.setInformativeText("Would you like to auto-create a default configuration file?")
+        msg.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        msg.setDefaultButton(QtWidgets.QMessageBox.Yes)
+        QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
+        user_choice = self.safe_exec_messagebox(msg)
+        self.handle_user_choice(user_choice, config_path, model_name)
 
     def handle_user_choice(self, user_choice, config_path, model_name):
-
         if user_choice == QtWidgets.QMessageBox.Yes:
-            # Try to detect valid exposure/gain names
             found_exposure, found_gain, raw_gain = self.check_attribute_names()
-
-            # Build basic config
             config_data = {
                 "exposure": {
-                    "title": "Exposure Settings",
-                    "name": "exposure",
-                    "type": "group",
+                    "title": "Exposure Settings", "name": "exposure", "type": "group",
                     "children": {
-                        "Exposure Auto": {
-                            "title": "Exposure Auto",
-                            "name": "ExposureAuto",
-                            "type": "led_push",
-                            "value": False,
-                            "default": False
-                        },
-                        "Exposure Time": {
-                            "title": "Exposure Time (ms)",
-                            "name": found_exposure,
-                            "type": "slide",
-                            "value": 100.0,
-                            "default": 100.0,
-                            "limits": [0.001, 10000.0]
-                        }
-                    }
+                        "Exposure Auto": {"title": "Exposure Auto", "name": "ExposureAuto",
+                                          "type": "led_push", "value": False, "default": False},
+                        "Exposure Time": {"title": "Exposure Time (ms)", "name": found_exposure,
+                                          "type": "slide", "value": 100.0, "default": 100.0,
+                                          "limits": [0.001, 10000.0]},
+                    },
                 },
                 "gain": {
-                    "title": "Gain Settings",
-                    "name": "gain",
-                    "type": "group",
+                    "title": "Gain Settings", "name": "gain", "type": "group",
                     "children": {
-                        "Gain Auto": {
-                            "title": "Gain Auto",
-                            "name": "GainAuto",
-                            "type": "led_push",
-                            "value": False,
-                            "default": False
-                        },
-                        "Gain": {
-                            "title": "Gain Value",
-                            "name": found_gain,
-                            "type": "slide",
-                            "value": 1.0,
-                            "default": 1.0,
-                            "limits": [0.0, 2.0],
-                            "int": raw_gain
-                        }
-                    }
-                }
+                        "Gain Auto": {"title": "Gain Auto", "name": "GainAuto",
+                                      "type": "led_push", "value": False, "default": False},
+                        "Gain": {"title": "Gain Value", "name": found_gain, "type": "slide",
+                                 "value": 1.0, "default": 1.0, "limits": [0.0, 2.0],
+                                 "int": raw_gain},
+                    },
+                },
             }
             try:
-                print(f"Creating default config for {model_name} at {config_path}")
                 with open(config_path, "w") as f:
                     json.dump(config_data, f, indent=4)
                 msg_info = QtWidgets.QMessageBox()
                 msg_info.setIcon(QtWidgets.QMessageBox.Information)
                 msg_info.setWindowTitle("Config Created")
                 msg_info.setText(f"Default config file created for '{model_name}'.")
-                msg_info.setInformativeText(f"Path:\n{config_path}\n\nYou can edit this file to add/remove parameters.")
+                msg_info.setInformativeText(
+                    f"Path:\n{config_path}\n\nYou can edit this file to add/remove parameters."
+                )
                 self.safe_exec_messagebox(msg_info, buttons="ok")
-                
             except Exception as e:
                 msg_err = QtWidgets.QMessageBox()
                 msg_err.setIcon(QtWidgets.QMessageBox.Critical)
@@ -391,8 +380,12 @@ class BaslerCamera:
             msg_info = QtWidgets.QMessageBox()
             msg_info.setIcon(QtWidgets.QMessageBox.Information)
             msg_info.setWindowTitle("Config Not Created")
-            msg_info.setText(f"You have chosen not to create a default config file for Basler '{model_name}'.")
-            msg_info.setInformativeText(f"You will not have access to camera parameters until you have a valid config file.\n\nYou can find examples of config files in the resources directory of this package or reinitialize and create a default.")
+            msg_info.setText(
+                f"You have chosen not to create a default config file for Basler '{model_name}'."
+            )
+            msg_info.setInformativeText(
+                "You will not have access to camera parameters until you have a valid config file."
+            )
             self.safe_exec_messagebox(msg_info, buttons="ok")
 
     def safe_exec_messagebox(self, msgbox: QtWidgets.QMessageBox, buttons: str = "yesno") -> int:
@@ -410,55 +403,47 @@ class BaslerCamera:
         if self._msg_opener is None:
             self._msg_opener = DefaultConfigMsg()
 
-        # Non-GUI thread (Windows only safe path)
         if sys.platform.startswith("win"):
             title = str(msgbox.windowTitle() or "PyMoDAQ")
             text = str(msgbox.text() or "")
             informative = msgbox.informativeText()
             if informative:
                 text += "\n\n" + str(informative)
-
             try:
                 icon_type = "info"
                 if msgbox.icon() == QtWidgets.QMessageBox.Question:
                     icon_type = "question"
                 elif msgbox.icon() == QtWidgets.QMessageBox.Critical:
                     icon_type = "error"
-
                 res = _win_message_box(title, text, buttons=buttons, icon=icon_type)
-
                 if buttons == "yesno":
-                    if res == IDYES:
-                        return int(QtWidgets.QMessageBox.Yes)
-                    return int(QtWidgets.QMessageBox.No)
-                else:
-                    return int(QtWidgets.QMessageBox.Ok)
-
+                    return int(QtWidgets.QMessageBox.Yes) if res == IDYES else int(QtWidgets.QMessageBox.No)
+                return int(QtWidgets.QMessageBox.Ok)
             except Exception:
                 return int(QtWidgets.QMessageBox.No)
         else:
             QtCore.QMetaObject.invokeMethod(
-                self._msg_opener,
-                "run_box",
+                self._msg_opener, "run_box",
                 QtCore.Qt.ConnectionType.AutoConnection,
-                QtCore.Q_ARG(object, show_dialog)
+                QtCore.Q_ARG(object, show_dialog),
             )
-
             if QtCore.QThread.currentThread() != QtWidgets.QApplication.instance().thread():
                 finished_event.wait()
                 QtCore.QTimer.singleShot(0, QtWidgets.QApplication.processEvents)
             else:
                 while not finished_event.is_set():
                     QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
-
             return result_container.get("choice", int(QtWidgets.QMessageBox.No))
-    
+
+
 class DefaultConfigMsg(QtCore.QObject):
     def __init__(self):
         super().__init__()
+
     @QtCore.Slot(object)
     def run_box(self, fn):
         fn()
+
 
 class ConfigurationHandler(pylon.ConfigurationEventHandler):
     """Handle the configuration events."""
@@ -468,12 +453,9 @@ class ConfigurationHandler(pylon.ConfigurationEventHandler):
         self.signals = self.ConfigurationHandlerSignals()
 
     class ConfigurationHandlerSignals(QtCore.QObject):
-        """Signals for the CameraEventHandler."""
-
         cameraRemoved = QtCore.pyqtSignal(object)
 
     def OnOpened(self, camera: pylon.InstantCamera) -> None:
-        """Standard configuration after being opened."""
         try:
             camera.PixelFormat.SetValue("Mono12")
         except Exception:
@@ -482,12 +464,11 @@ class ConfigurationHandler(pylon.ConfigurationEventHandler):
         camera.ExposureAuto.SetValue("Off")
 
     def OnCameraDeviceRemoved(self, camera: pylon.InstantCamera) -> None:
-        """Emit a signal that the camera is removed."""
         self.signals.cameraRemoved.emit(camera)
 
 
 class ImageEventHandler(pylon.ImageEventHandler):
-    """Handle the events and translates them to signals/slots."""
+    """Handle grab events and translate them to Qt signals."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -495,27 +476,25 @@ class ImageEventHandler(pylon.ImageEventHandler):
         self.frame_ready = False
 
     class ImageEventHandlerSignals(QtCore.QObject):
-        """Signals for the ImageEventHandler."""
-
         imageGrabbed = QtCore.pyqtSignal(object)
 
     def OnImageSkipped(self, camera: pylon.InstantCamera, countOfSkippedImages: int) -> None:
-        """Handle a skipped image."""
         logger.warning(f"{countOfSkippedImages} images have been skipped.")
 
     def OnImageGrabbed(self, camera: pylon.InstantCamera, grabResult: pylon.GrabResult) -> None:
-        """Process a grabbed image."""
         if grabResult.GrabSucceeded():
             self.frame_ready = True
-            frame_data = {"frame": grabResult.GetArray(), "timestamp": grabResult.GetTimeStamp()}
+            frame_data = {
+                "frame": grabResult.GetArray(),
+                "timestamp": grabResult.GetTimeStamp(),
+            }
             self.signals.imageGrabbed.emit(frame_data)
         else:
             logger.warning(
-                (
-                    f"Grab failed with code {grabResult.GetErrorCode()}, "
-                    f"{grabResult.GetErrorDescription()}."
-                )
+                f"Grab failed with code {grabResult.GetErrorCode()}, "
+                f"{grabResult.GetErrorDescription()}."
             )
+
 
 class TemperatureMonitor(QtCore.QObject):
     temperature_updated = QtCore.pyqtSignal(float)
@@ -539,6 +518,7 @@ class TemperatureMonitor(QtCore.QObject):
                 pass
             QtCore.QThread.msleep(self.interval)
         self.finished.emit()
+
 
 def detector_clamp(value: Union[float, int], max_value: int) -> int:
     """Clamp a value to possible detector position."""
