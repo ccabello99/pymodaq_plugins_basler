@@ -276,7 +276,23 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         if name == 'burst_enable':
             # Just arming/disarming; actual burst starts in grab_data
-            if not value:
+            if value:
+                try:
+                    frame_rate = self.settings.param('AcquisitionFrameRateAbs').value()
+                except Exception:
+                    try:
+                        frame_rate = self.settings.param('AcquisitionFrameRate').value()
+                    except Exception:
+                        frame_rate = None                
+                burst_armed = value
+                trigger_on = False
+                try:
+                    trigger_on = self.settings.child('trigger', 'TriggerMode').value()
+                except Exception:
+                    pass
+                if burst_armed and trigger_on:
+                    self._start_burst(frame_rate)
+            else:
                 # User disarmed while idle – nothing to do
                 if not self._burst_active:
                     return
@@ -361,16 +377,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                 except Exception:
                     frame_rate = None
 
-            burst_armed = self.settings.child('burst', 'burst_enable').value()
-            trigger_on = False
-            try:
-                trigger_on = self.settings.child('trigger', 'TriggerMode').value()
-            except Exception:
-                pass
-
-            if burst_armed and trigger_on:
-                self._start_burst(frame_rate)
-            elif live:
+            if live:
                 self.controller.start_grabbing(frame_rate, burst_mode=False)
             else:
                 self.controller.start_grabbing(frame_rate, burst_mode=False)
@@ -451,6 +458,9 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             self.emit_status(ThreadCommand('Update_Status',
                                            ["Burst already in progress – ignoring."]))
             return
+        
+        # Ensure grabbing stopped before we set up burst
+        self.stop()
 
         max_frames = self.settings.child('burst', 'burst_stop_group', 'burst_nframes').value()
         max_seconds = self.settings.child('burst', 'burst_stop_group', 'burst_nseconds').value()
