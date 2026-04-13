@@ -461,17 +461,35 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         max_frames = max_frames if max_frames > 0 else None
         max_seconds = max_seconds if max_seconds > 0.0 else None
 
-        save_dir = self.settings.child('burst', 'burst_path').value()
-        if not save_dir:
-            save_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
-        prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
-        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{prefix}_{timestamp_str}.h5"
-        self._burst_h5_path = os.path.join(save_dir, filename)
+
+        if self.metadata is not None:
+            metadata = self.metadata
+            filepath = self.metadata['file_metadata']['filepath']
+            filename = self.metadata['file_metadata']['filename']
+            self.metadata['burst_metadata']['user_id'] = self.user_id
+            basepath = self.settings.child('leco_log', 'leco_basepath').value()
+            prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
+            self._burst_h5_path = os.path.normpath(
+                os.path.join(basepath, f"{prefix}_{filepath.lstrip(os.path.sep)}")
+            )
+        else:
+            save_dir = self.settings.child('burst', 'burst_path').value()
+            if not save_dir:
+                save_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
+            prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
+            timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{prefix}_{timestamp_str}.h5"
+            self._burst_h5_path = os.path.join(save_dir, filename)
 
         (hstart, hend, vstart, vend, xbin, ybin) = self.controller.get_roi()
         height = hend - hstart
         width = vend - vstart
+
+        self.controller.camera.TriggerSelector.SetValue("AcquisitionStart")
+        self.controller.camera.TriggerMode.SetValue("On")
+        self.controller.camera.TriggerSource.SetValue("Line1")
+        self.controller.camera.TriggerSelector.SetValue("FrameStart")
+        self.controller.camera.TriggerSource.SetValue("Line3")
 
         exposure_ms = 0.0
         gain_val = 0.0
@@ -495,6 +513,17 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             "roi": [hstart, vstart, width, height],
             "fps_target": frame_rate or 1000,
         }
+
+        if self.metadata is not None:
+            burst_meta = self.metadata.get('burst_metadata', {})
+            detector_meta = self.metadata.get('detector_metadata', {})
+            camera_meta['uuid'] = burst_meta.get('uuid', str(uuid7()))
+            camera_meta['fuzziness'] = detector_meta.get('fuzziness', 0.1)
+            camera_meta['conduktor_metadata'] = self.metadata
+        else:
+            camera_meta['uuid'] = str(uuid7())
+            camera_meta['fuzziness'] = 0.1
+            camera_meta['conduktor_metadata'] = {}        
 
         display_nth = self.settings.child(
             'burst', 'burst_perf_group', 'burst_display_nth'
@@ -569,6 +598,9 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             self._burst_thread.wait(5000)  # 5 s timeout
 
         self._burst_active = False
+
+        self.controller.camera.TriggerSelector.SetValue("AcquisitionStart")
+        self.controller.camera.TriggerMode.SetValue("Off")
 
     @QtCore.Slot(object)
     def _on_burst_display_frame(self, frame: np.ndarray):

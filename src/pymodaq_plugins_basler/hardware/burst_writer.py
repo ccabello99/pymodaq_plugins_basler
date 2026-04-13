@@ -17,6 +17,7 @@ Design principles:
 import queue
 import time
 import os
+import json
 from datetime import datetime
 from typing import Optional
 
@@ -190,6 +191,11 @@ class BurstWriter(QtCore.QObject):
                 )
 
                 # --- Root attributes ---
+                f.attrs["uuid"] = self.camera_meta.get("uuid", "")
+                f.attrs["fuzziness"] = self.camera_meta.get("fuzziness", 0.1)
+                leco_meta = self.camera_meta.get("conduktor_metadata", {})
+                if leco_meta:
+                    f.attrs["conduktor_metadata"] = json.dumps(leco_meta)
                 f.attrs["format_version"] = "burst-v1.0"
                 f.attrs["camera_model"] = self.camera_meta.get("camera_model", "")
                 f.attrs["serial_number"] = self.camera_meta.get("serial_number", "")
