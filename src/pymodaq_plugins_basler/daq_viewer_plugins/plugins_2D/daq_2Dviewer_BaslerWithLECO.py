@@ -485,10 +485,11 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         height = hend - hstart
         width = vend - vstart
 
-        self.controller.camera.TriggerSelector.SetValue("AcquisitionStart")
+        self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
         self.controller.camera.TriggerMode.SetValue("On")
         self.controller.camera.TriggerSource.SetValue("Line1")
         self.controller.camera.TriggerSelector.SetValue("FrameStart")
+        self.controller.camera.TriggerMode.SetValue("On")
         self.controller.camera.TriggerSource.SetValue("Line3")
 
         exposure_ms = 0.0
@@ -599,7 +600,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         self._burst_active = False
 
-        self.controller.camera.TriggerSelector.SetValue("AcquisitionStart")
+        self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
         self.controller.camera.TriggerMode.SetValue("Off")
 
     @QtCore.Slot(object)
