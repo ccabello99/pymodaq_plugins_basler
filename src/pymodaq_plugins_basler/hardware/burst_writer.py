@@ -115,7 +115,7 @@ class BurstWriter(QtCore.QObject):
             raise ValueError("One of max_frames or max_seconds must be set.")
 
         self.h5_path = h5_path
-        self.frame_shape = frame_shape  # (H, W)
+        self.frame_shape = frame_shape  # (w, h)
         self.dtype = dtype
         self.max_frames = max_frames
         self.max_seconds = max_seconds
@@ -132,10 +132,6 @@ class BurstWriter(QtCore.QObject):
         self._stop_requested: bool = False
 
         self.signals = BurstWriterSignals()
-
-    # ------------------------------------------------------------------
-    # Public API (called from grab callback thread)
-    # ------------------------------------------------------------------
 
     def enqueue(self, frame: np.ndarray, timestamp: int) -> bool:
         """
@@ -165,13 +161,9 @@ class BurstWriter(QtCore.QObject):
         self._stop_requested = True
         self._queue.put_nowait(_STOP_SENTINEL)
 
-    # ------------------------------------------------------------------
-    # Worker entry point – called by QThread.started signal
-    # ------------------------------------------------------------------
-
     def run(self):
         self._start_time = time.monotonic()
-        h, w = self.frame_shape
+        w, h = self.frame_shape
 
         os.makedirs(os.path.dirname(self.h5_path), exist_ok=True)
 
@@ -182,10 +174,10 @@ class BurstWriter(QtCore.QObject):
                 # This is the single most important tuning knob for I/O perf.
                 frames_ds = f.create_dataset(
                     "frames",
-                    shape=(0, h, w),
-                    maxshape=(None, h, w),
+                    shape=(0, w, h),
+                    maxshape=(None, w, h),
                     dtype=self.dtype,
-                    chunks=(self.chunk_size, h, w),
+                    chunks=(self.chunk_size, w, h),
                     # No compression: raw throughput is the priority.
                     # Swap to compression=lzf if storage is a constraint.
                 )
@@ -210,7 +202,7 @@ class BurstWriter(QtCore.QObject):
                 f.attrs["created_utc"] = datetime.utcnow().isoformat()
 
                 # --- Accumulation buffers (write in chunks, not one-by-one) ---
-                frame_buf = np.empty((self.chunk_size, h, w), dtype=self.dtype)
+                frame_buf = np.empty((self.chunk_size, w, h), dtype=self.dtype)
                 ts_buf = np.empty(self.chunk_size, dtype=np.uint64)
                 buf_idx = 0
 
@@ -292,9 +284,6 @@ class BurstWriter(QtCore.QObject):
         )
         self.signals.burst_finished.emit(summary)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _write_chunk(self, frames_ds, ts_ds, frame_buf, ts_buf, count):
         """Extend the datasets and write ``count`` frames from the buffers."""

@@ -84,10 +84,10 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             {'title': 'Performance', 'name': 'burst_perf_group',
              'type': 'group', 'children': [
                  {'title': 'Display Every Nth Frame', 'name': 'burst_display_nth',
-                  'type': 'int', 'value': 40, 'min': 1,
+                  'type': 'int', 'value': 200, 'min': 1,
                   'tip': '40 → ~25 Hz display refresh at 1 kHz acquisition.'},
                  {'title': 'Write Chunk Size', 'name': 'burst_chunk',
-                  'type': 'int', 'value': 50, 'min': 1,
+                  'type': 'int', 'value': 20, 'min': 1,
                   'tip': 'Frames written per HDF5 extend call. '
                          'Larger = fewer I/O calls but more end-of-burst latency.'},
                  {'title': 'Queue Max Size', 'name': 'burst_queue_size',
@@ -515,7 +515,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         self._burst_writer = BurstWriter(
             h5_path=self._burst_h5_path,
-            frame_shape=(height, width),
+            frame_shape=(width, height),
             dtype=dtype,
             max_frames=max_frames,
             max_seconds=max_seconds,
