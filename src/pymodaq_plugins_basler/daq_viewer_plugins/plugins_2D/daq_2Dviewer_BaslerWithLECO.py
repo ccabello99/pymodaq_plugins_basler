@@ -64,43 +64,38 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         {'title': 'Burst Recording', 'name': 'burst', 'type': 'group', 'children': [
             {'title': 'Enable Burst Mode', 'name': 'burst_enable',
              'type': 'led_push', 'value': False, 'default': False,
-             'tip': 'Arms burst mode. Actual acquisition starts with the next '
-                    '"grab". Requires trigger mode to be active.'},
+             'tip': 'Arms burst mode. Triggers camera and waits for Line1 '
+                    '(FrameBurstStart) then Line3 (FrameStart) hardware triggers.'},
             {'title': 'Save Path', 'name': 'burst_path',
-             'type': 'browsepath', 'value': '', 'filetype': False,
-             'tip': 'Directory where the HDF5 burst file will be written.'},
+             'type': 'browsepath', 'value': '', 'filetype': False},
             {'title': 'Filename Prefix', 'name': 'burst_prefix',
              'type': 'str', 'value': 'burst',
              'tip': 'File will be named <prefix>_YYYYMMDD_HHMMSS.h5'},
             {'title': 'Stop Condition', 'name': 'burst_stop_group',
              'type': 'group', 'children': [
                  {'title': 'Max Frames (0 = time-bounded)', 'name': 'burst_nframes',
-                  'type': 'int', 'value': 1000, 'min': 0,
-                  'tip': 'Set to 0 to use Max Seconds instead.'},
+                  'type': 'int', 'value': 1000, 'min': 0},
                  {'title': 'Max Seconds (0 = frame-bounded)', 'name': 'burst_nseconds',
-                  'type': 'float', 'value': 0.0, 'min': 0.0,
-                  'tip': 'Set to 0 to use Max Frames instead.'},
+                  'type': 'float', 'value': 0.0, 'min': 0.0},
              ]},
             {'title': 'Performance', 'name': 'burst_perf_group',
              'type': 'group', 'children': [
                  {'title': 'Display Every Nth Frame', 'name': 'burst_display_nth',
-                  'type': 'int', 'value': 200, 'min': 1,
-                  'tip': '40 → ~25 Hz display refresh at 1 kHz acquisition.'},
+                  'type': 'int', 'value': 200, 'min': 1},
                  {'title': 'Write Chunk Size', 'name': 'burst_chunk',
-                  'type': 'int', 'value': 20, 'min': 1,
-                  'tip': 'Frames written per HDF5 extend call. '
-                         'Larger = fewer I/O calls but more end-of-burst latency.'},
+                  'type': 'int', 'value': 20, 'min': 1},
                  {'title': 'Queue Max Size', 'name': 'burst_queue_size',
-                  'type': 'int', 'value': 500, 'min': 10,
-                  'tip': 'In-process queue depth. If the writer falls behind '
-                         'and the queue fills, frames are dropped.'},
+                  'type': 'int', 'value': 500, 'min': 10},
                  {'title': 'Overflow Policy', 'name': 'burst_overflow',
                   'type': 'list',
                   'limits': ['drop_newest', 'drop_oldest'],
-                  'value': 'drop_newest',
-                  'tip': 'drop_newest: discard incoming frame when queue is full. '
-                         'drop_oldest: discard oldest queued frame to make room.'},
+                  'value': 'drop_newest'},
+                 {'title': 'Trigger Timeout (s)', 'name': 'burst_trigger_timeout',
+                  'type': 'float', 'value': 30.0, 'min': 1.0,
+                  'tip': 'How long to wait for the first hardware trigger '
+                         'before aborting the burst.'},
              ]},
+            # Live readouts
             {'title': 'Status', 'name': 'burst_status',
              'type': 'str', 'value': 'Idle', 'readonly': True},
             {'title': 'Frames Written', 'name': 'burst_written',
@@ -110,6 +105,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             {'title': 'Elapsed (s)', 'name': 'burst_elapsed',
              'type': 'float', 'value': 0.0, 'readonly': True},
         ]},
+
         {'title': 'LECO Logging', 'name': 'leco_log', 'type': 'group', 'children': [
             {'title': 'Send Frame Data?', 'name': 'leco_send',
              'type': 'led_push', 'value': False, 'default': False,
@@ -130,16 +126,10 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         self.controller: Optional[BaslerCamera] = None
         self.user_id = None
         self.data_shape = None
-
-        # Normal trigger-save state
         self.save_frame = False
-
-        # LECO state
         self.metadata = None
         self.data_publisher = None
         self.send_frame_leco = False
-
-        # Burst state
         self._burst_active = False
         self._burst_writer: Optional[BurstWriter] = None
         self._burst_thread: Optional[QtCore.QThread] = None
@@ -199,7 +189,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             base_path = ''
         self.settings.child('leco_log', 'leco_basepath').setValue(base_path)
 
-        # Default burst path to Downloads if unset
         if not self.settings.child('burst', 'burst_path').value():
             self.settings.child('burst', 'burst_path').setValue(
                 os.path.join(os.path.expanduser('~'), 'Downloads')
@@ -275,7 +264,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             return
 
         if name == 'burst_enable':
-            # Just arming/disarming; actual burst starts in grab_data
             if value:
                 try:
                     frame_rate = self.settings.param('AcquisitionFrameRateAbs').value()
@@ -283,20 +271,11 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                     try:
                         frame_rate = self.settings.param('AcquisitionFrameRate').value()
                     except Exception:
-                        frame_rate = None                
-                burst_armed = value
-                trigger_on = False
-                try:
-                    trigger_on = self.settings.child('trigger', 'TriggerMode').value()
-                except Exception:
-                    pass
-                if burst_armed and trigger_on:
-                    self._start_burst(frame_rate)
+                        frame_rate = None
+                self._start_burst(frame_rate)
             else:
-                # User disarmed while idle – nothing to do
                 if not self._burst_active:
                     return
-                # User disarmed while a burst is in progress – stop it
                 self._stop_burst()
             return
 
@@ -368,7 +347,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
     def grab_data(self, Naverage: int = 1, live: bool = False, **kwargs) -> None:
         try:
             self._prepare_view()
-
             try:
                 frame_rate = self.settings.param('AcquisitionFrameRateAbs').value()
             except Exception:
@@ -394,7 +372,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         timestamp = frame_data['timestamp']
 
         if self._burst_active:
-            # hand off immediately, do nothing else
             self._burst_writer.enqueue(frame.copy(), timestamp)
             return
 
@@ -451,15 +428,13 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         self.emit_status(ThreadCommand('Update_Status',
                                        [f"{self.user_id} communication terminated"]))
 
-
     def _start_burst(self, frame_rate):
         """Construct the BurstWriter, wire up signals, and start grabbing."""
         if self._burst_active:
             self.emit_status(ThreadCommand('Update_Status',
                                            ["Burst already in progress – ignoring."]))
             return
-        
-        # Ensure grabbing stopped before we set up burst
+
         self.stop()
 
         max_frames = self.settings.child('burst', 'burst_stop_group', 'burst_nframes').value()
@@ -471,11 +446,8 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         max_frames = max_frames if max_frames > 0 else None
         max_seconds = max_seconds if max_seconds > 0.0 else None
 
-
         if self.metadata is not None:
-            metadata = self.metadata
             filepath = self.metadata['file_metadata']['filepath']
-            filename = self.metadata['file_metadata']['filename']
             self.metadata['burst_metadata']['user_id'] = self.user_id
             basepath = self.settings.child('leco_log', 'leco_basepath').value()
             prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
@@ -488,19 +460,11 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                 save_dir = os.path.join(os.path.expanduser('~'), 'Downloads')
             prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
             timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{prefix}_{timestamp_str}.h5"
-            self._burst_h5_path = os.path.join(save_dir, filename)
+            self._burst_h5_path = os.path.join(save_dir, f"{prefix}_{timestamp_str}.h5")
 
+        actual_width = self.controller.camera.Width.GetValue()
+        actual_height = self.controller.camera.Height.GetValue()
         (hstart, hend, vstart, vend, xbin, ybin) = self.controller.get_roi()
-        height = hend - hstart
-        width = vend - vstart
-
-        self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-        self.controller.camera.TriggerMode.SetValue("On")
-        self.controller.camera.TriggerSource.SetValue("Line1")
-        self.controller.camera.TriggerSelector.SetValue("FrameStart")
-        self.controller.camera.TriggerMode.SetValue("On")
-        self.controller.camera.TriggerSource.SetValue("Line3")
 
         exposure_ms = 0.0
         gain_val = 0.0
@@ -521,7 +485,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             "serial_number": self.controller.device_info.GetSerialNumber(),
             "exposure_time_ms": exposure_ms,
             "gain": gain_val,
-            "roi": [hstart, vstart, width, height],
+            "roi": [hstart, vstart, actual_width, actual_height],
             "fps_target": frame_rate or 1000,
         }
 
@@ -534,19 +498,14 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         else:
             camera_meta['sequence_uuid'] = str(uuid7())
             camera_meta['fuzziness'] = 0.1
-            camera_meta['conduktor_metadata'] = {}        
+            camera_meta['conduktor_metadata'] = {}
 
-        display_nth = self.settings.child(
-            'burst', 'burst_perf_group', 'burst_display_nth'
-        ).value()
-        chunk_size = self.settings.child(
-            'burst', 'burst_perf_group', 'burst_chunk'
-        ).value()
-        queue_size = self.settings.child(
-            'burst', 'burst_perf_group', 'burst_queue_size'
-        ).value()
-        overflow = self.settings.child(
-            'burst', 'burst_perf_group', 'burst_overflow'
+        display_nth = self.settings.child('burst', 'burst_perf_group', 'burst_display_nth').value()
+        chunk_size = self.settings.child('burst', 'burst_perf_group', 'burst_chunk').value()
+        queue_size = self.settings.child('burst', 'burst_perf_group', 'burst_queue_size').value()
+        overflow = self.settings.child('burst', 'burst_perf_group', 'burst_overflow').value()
+        trigger_timeout = self.settings.child(
+            'burst', 'burst_perf_group', 'burst_trigger_timeout'
         ).value()
         drop_oldest = overflow == 'drop_oldest'
 
@@ -556,9 +515,16 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         except Exception:
             dtype = np.uint16
 
+        self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
+        self.controller.camera.TriggerMode.SetValue("On")
+        self.controller.camera.TriggerSource.SetValue("Line1")
+        self.controller.camera.TriggerSelector.SetValue("FrameStart")
+        self.controller.camera.TriggerMode.SetValue("On")
+        self.controller.camera.TriggerSource.SetValue("Line3")
+
         self._burst_writer = BurstWriter(
             h5_path=self._burst_h5_path,
-            frame_shape=(width, height),
+            frame_shape=(actual_height, actual_width),  # (H, W) numpy convention
             dtype=dtype,
             max_frames=max_frames,
             max_seconds=max_seconds,
@@ -567,8 +533,10 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             queue_maxsize=queue_size,
             drop_oldest=drop_oldest,
             camera_meta=camera_meta,
+            first_frame_timeout=trigger_timeout,
         )
 
+        self._burst_writer.signals.first_frame_received.connect(self._on_burst_first_frame)
         self._burst_writer.signals.display_frame.connect(self._on_burst_display_frame)
         self._burst_writer.signals.progress.connect(self._on_burst_progress)
         self._burst_writer.signals.burst_finished.connect(self._on_burst_finished)
@@ -579,43 +547,50 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         self._burst_thread.started.connect(self._burst_writer.run)
         self._burst_thread.finished.connect(self._burst_thread.deleteLater)
 
-        self._set_burst_status("Recording…")
+        self._set_burst_status(f"Armed – waiting for trigger on Line1… (timeout {trigger_timeout:.0f}s)")
         self._set_burst_readouts(0, 0, 0.0)
 
         self._burst_active = True
         self._burst_thread.start()
+
         self.controller.start_grabbing(frame_rate, burst_mode=True)
 
         self.emit_status(ThreadCommand('Update_Status',
-                                       [f"Burst started → {self._burst_h5_path}"]))
+                                       [f"Burst armed → {self._burst_h5_path}"]))
 
     def _stop_burst(self, wait: bool = False):
-        """Request the writer to stop and clean up the thread."""
+        """Request the writer to stop and clean up."""
         if not self._burst_active:
             return
 
-        # Stop the camera first so no more frames arrive
         try:
             self.controller.stop_grabbing()
         except Exception:
             pass
 
-        # Signal writer to drain and exit
         if self._burst_writer is not None:
             self._burst_writer.request_stop()
 
         if wait and self._burst_thread is not None:
             self._burst_thread.quit()
-            self._burst_thread.wait(5000)  # 5 s timeout
+            self._burst_thread.wait(5000)
 
         self._burst_active = False
 
-        self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-        self.controller.camera.TriggerMode.SetValue("Off")
+        try:
+            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
+            self.controller.camera.TriggerMode.SetValue("Off")
+        except Exception:
+            pass
+
+    @QtCore.Slot()
+    def _on_burst_first_frame(self):
+        """First hardware trigger received — update status to show recording is live."""
+        self._set_burst_status("Recording…")
+        self.emit_status(ThreadCommand('Update_Status', ["Burst: first frame received, recording."]))
 
     @QtCore.Slot(object)
     def _on_burst_display_frame(self, frame: np.ndarray):
-        """Throttled display update during burst – runs in GUI thread."""
         dte = DataToExport(
             f'{self.user_id}',
             data=[DataFromPlugins(
@@ -630,22 +605,18 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
     @QtCore.Slot(int, int, float)
     def _on_burst_progress(self, written: int, dropped: int, elapsed: float):
-        """Periodic progress update during burst."""
         self._set_burst_readouts(written, dropped, elapsed)
 
     @QtCore.Slot(dict)
     def _on_burst_finished(self, summary: dict):
-        """Called once the writer thread has finished."""
         self._burst_active = False
 
-        # Finalize thread
         if self._burst_thread is not None:
             self._burst_thread.quit()
             self._burst_thread.wait()
             self._burst_thread = None
         self._burst_writer = None
 
-        # Update GUI
         self._set_burst_readouts(
             summary['frames_written'],
             summary['frames_dropped'],
@@ -659,22 +630,31 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         )
         self._set_burst_status(status_msg)
 
-        # Reset arm button
         p = self.settings.child('burst', 'burst_enable')
         p.setValue(False)
         p.sigValueChanged.emit(p, False)
 
         self.emit_status(ThreadCommand('Update_Status', [status_msg]))
-
-        # Publish LECO end-of-burst summary
         self._publish_burst_summary(summary)
 
     @QtCore.Slot(str)
     def _on_burst_error(self, msg: str):
         self._burst_active = False
+
+        # Clean up thread
+        if self._burst_thread is not None:
+            self._burst_thread.quit()
+            self._burst_thread.wait()
+            self._burst_thread = None
+        self._burst_writer = None
+
+        # Reset arm button
+        p = self.settings.child('burst', 'burst_enable')
+        p.setValue(False)
+        p.sigValueChanged.emit(p, False)
+
         self._set_burst_status(f"ERROR: {msg}")
         self.emit_status(ThreadCommand('Update_Status', [f"Burst error: {msg}", "log"]))
-
 
     def _set_burst_status(self, text: str):
         p = self.settings.child('burst', 'burst_status')
@@ -691,21 +671,18 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             p.setValue(val)
             p.sigValueChanged.emit(p, val)
 
- 
     def _publish_burst_summary(self, summary: dict):
-        """Publish a single end-of-burst LECO message."""
         if self.data_publisher is None:
             return
         try:
             publisher_name = self.settings.child('leco_log', 'publisher_name').value()
-            payload = {
+            self.data_publisher.send_data2({
                 publisher_name: {
                     **summary,
                     "user_id": self.user_id,
                     "h5_path": self._burst_h5_path,
                 }
-            }
-            self.data_publisher.send_data2(payload)
+            })
         except Exception as e:
             self.emit_status(ThreadCommand('Update_Status',
                                            [f"LECO burst publish failed: {e}"]))
@@ -809,7 +786,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                     'serial_number': self.controller.device_info.GetSerialNumber(),
                     'format_version': 'hdf5-v0.1',
                 }})
-
 
     def _prepare_view(self):
         (hstart, hend, vstart, vend, *binning) = self.controller.get_roi()
@@ -932,26 +908,19 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                     self.settings.addChild(attr)
 
     def update_params_ui(self):
-        self.settings.child('device_info', 'DeviceModelName').setValue(
-            self.controller.model_name
-        )
+        self.settings.child('device_info', 'DeviceModelName').setValue(self.controller.model_name)
         self.settings.child('device_info', 'DeviceSerialNumber').setValue(
-            self.controller.device_info.GetSerialNumber()
-        )
+            self.controller.device_info.GetSerialNumber())
         self.settings.child('device_info', 'DeviceVersion').setValue(
-            self.controller.device_info.GetDeviceVersion()
-        )
+            self.controller.device_info.GetDeviceVersion())
         self.settings.child('device_info', 'DeviceUserID').setValue(
-            self.controller.device_info.GetFriendlyName()
-        )
+            self.controller.device_info.GetFriendlyName())
 
         for param in self.controller.attributes:
             param_type = param['type']
             param_name = param['name']
-
             if param_name in ("device_info", "device_state", "temperature"):
                 continue
-
             if param_type == 'group':
                 for child in param['children']:
                     child_name = child['name']

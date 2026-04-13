@@ -12,9 +12,13 @@ Design principles:
     callback never touches Qt signals directly during a burst.
   - A summary signal fires at the end of the burst, carrying everything
     needed for a LECO end-of-burst publish.
+  - The writer blocks until the first frame arrives before starting its
+    timer and termination logic, so time/frame-bounded bursts are not
+    consumed by the wait for the hardware trigger.
 """
 
 import queue
+import threading
 import time
 import os
 import json
@@ -29,7 +33,6 @@ if not hasattr(QtCore, "pyqtSignal"):
     QtCore.pyqtSignal = QtCore.Signal  # type: ignore
 
 
-
 # Queue item sentinel – put this into the queue to signal "burst is done"
 _STOP_SENTINEL = object()
 
@@ -38,14 +41,15 @@ class BurstWriterSignals(QtCore.QObject):
     """All Qt signals emitted by :class:`BurstWriter`."""
 
     # Emitted for every Nth frame so the GUI can refresh at a sane rate.
-    # Carries the raw numpy array (a reference, not a copy – don't modify it).
     display_frame = QtCore.pyqtSignal(object)
 
     # Progress update: (frames_written, frames_dropped, elapsed_seconds)
     progress = QtCore.pyqtSignal(int, int, float)
 
+    # Emitted once the first frame has been received – useful for GUI feedback.
+    first_frame_received = QtCore.pyqtSignal()
+
     # Emitted once when the burst finishes (successfully or after an error).
-    # Payload is a dict – see _build_summary() for the schema.
     burst_finished = QtCore.pyqtSignal(dict)
 
     # Emitted on an unrecoverable write error.
@@ -56,44 +60,34 @@ class BurstWriter(QtCore.QObject):
     """
     Worker object that must be moved to a dedicated :class:`QtCore.QThread`.
 
-    Usage::
-
-        self.burst_writer = BurstWriter(...)
-        self.burst_thread = QtCore.QThread()
-        self.burst_writer.moveToThread(self.burst_thread)
-        self.burst_thread.started.connect(self.burst_writer.run)
-        self.burst_thread.start()
-
-    The :meth:`enqueue` method is thread-safe and is the only method that
-    should be called from outside the worker thread during a burst.
+    The writer blocks in :meth:`run` until the first frame arrives via
+    :meth:`enqueue`, then starts its timer and termination logic.  This means
+    time/frame-bounded bursts are not consumed by the hardware-trigger latency.
 
     Parameters
     ----------
     h5_path : str
         Full path of the HDF5 file to create.
     frame_shape : tuple[int, int]
-        (height, width) of each frame.
+        (height, width) of each frame in numpy (row, col) order.
     dtype : np.dtype
         Data type of each frame (e.g. np.uint16).
     max_frames : int or None
-        Hard cap on frames to write. When reached the burst stops.
-        Pass None for a time-bounded burst (use ``max_seconds`` instead).
+        Hard cap on frames to write. Pass None for a time-bounded burst.
     max_seconds : float or None
         Time cap in seconds. Ignored if ``max_frames`` is not None.
     display_every_nth : int
-        Emit a display signal every Nth frame. 40 → ~25 Hz display at 1 kHz.
+        Emit a display signal every Nth frame.
     chunk_size : int
-        Number of frames written to HDF5 in a single dataset extend+write.
-        Larger = fewer I/O calls, but more latency on the final flush.
+        Frames written to HDF5 per extend+write call.
     queue_maxsize : int
-        Maximum number of frames held in the in-process queue. When full,
-        behaviour is controlled by ``drop_oldest``.
+        Maximum frames held in the in-process queue before overflow.
     drop_oldest : bool
-        If True, when the queue is full the oldest frame is discarded to make
-        room for the new one (preserves recency). If False, the newest frame
-        is discarded (safer for ordered reconstructions).
+        If True, oldest frame is dropped on overflow. If False, newest is dropped.
     camera_meta : dict
         Arbitrary camera metadata written as HDF5 root attributes.
+    first_frame_timeout : float
+        Seconds to wait for the first frame before aborting. Default 30 s.
     """
 
     def __init__(
@@ -108,6 +102,7 @@ class BurstWriter(QtCore.QObject):
         queue_maxsize: int = 500,
         drop_oldest: bool = False,
         camera_meta: Optional[dict] = None,
+        first_frame_timeout: float = 30.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -116,7 +111,7 @@ class BurstWriter(QtCore.QObject):
             raise ValueError("One of max_frames or max_seconds must be set.")
 
         self.h5_path = h5_path
-        self.frame_shape = frame_shape  # (w, h)
+        self.frame_shape = frame_shape  # (H, W) — numpy row-major
         self.dtype = dtype
         self.max_frames = max_frames
         self.max_seconds = max_seconds
@@ -124,6 +119,7 @@ class BurstWriter(QtCore.QObject):
         self.chunk_size = chunk_size
         self.drop_oldest = drop_oldest
         self.camera_meta = camera_meta or {}
+        self.first_frame_timeout = first_frame_timeout
 
         self._queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self._frames_written: int = 0
@@ -132,26 +128,33 @@ class BurstWriter(QtCore.QObject):
         self._start_time: Optional[float] = None
         self._stop_requested: bool = False
 
+        # Gate: run() blocks here until the first frame arrives.
+        self._first_frame_event = threading.Event()
+
         self.signals = BurstWriterSignals()
+
+    # ------------------------------------------------------------------
+    # Public API (called from grab callback thread)
+    # ------------------------------------------------------------------
 
     def enqueue(self, frame: np.ndarray, timestamp: int) -> bool:
         """
-        Put a frame into the writer queue.  Returns True if enqueued,
-        False if the frame was dropped due to queue overflow.
-
-        This method is thread-safe and designed to be as fast as possible
-        – it does nothing except put an item into a Queue.
+        Put a frame into the writer queue.  Thread-safe, returns in microseconds.
+        Returns True if enqueued, False if dropped due to overflow.
         """
+        # Release the first-frame gate on the very first call.
+        if not self._first_frame_event.is_set():
+            self._first_frame_event.set()
+
         item = (frame, timestamp)
         if self._queue.full():
             self._frames_dropped += 1
             if self.drop_oldest:
                 try:
-                    self._queue.get_nowait()  # discard oldest
+                    self._queue.get_nowait()
                 except queue.Empty:
                     pass
                 self._queue.put_nowait(item)
-            # else: just drop the newest (don't put it in)
             return False
         else:
             self._queue.put_nowait(item)
@@ -160,27 +163,30 @@ class BurstWriter(QtCore.QObject):
     def request_stop(self):
         """Signal the writer loop to finish after draining the queue."""
         self._stop_requested = True
+        # Also release the first-frame gate in case we are stopped while
+        # waiting for the hardware trigger (e.g. user aborts).
+        self._first_frame_event.set()
         self._queue.put_nowait(_STOP_SENTINEL)
 
-    def run(self):
-        self._start_time = time.monotonic()
-        w, h = self.frame_shape
+    # ------------------------------------------------------------------
+    # Worker entry point
+    # ------------------------------------------------------------------
 
-        os.makedirs(os.path.dirname(self.h5_path), exist_ok=True)
+    def run(self):
+        h, w = self.frame_shape
+
+        os.makedirs(os.path.dirname(os.path.abspath(self.h5_path)), exist_ok=True)
 
         try:
             with h5py.File(self.h5_path, "w") as f:
+
                 # --- Pre-allocate resizable datasets ---
-                # chunk layout: one HDF5 chunk = chunk_size frames.
-                # This is the single most important tuning knob for I/O perf.
                 frames_ds = f.create_dataset(
                     "frames",
-                    shape=(0, w, h),
-                    maxshape=(None, w, h),
+                    shape=(0, h, w),
+                    maxshape=(None, h, w),
                     dtype=self.dtype,
-                    chunks=(self.chunk_size, w, h),
-                    # No compression: raw throughput is the priority.
-                    # Swap to compression=lzf if storage is a constraint.
+                    chunks=(self.chunk_size, h, w),
                 )
                 ts_ds = f.create_dataset(
                     "timestamps",
@@ -190,12 +196,8 @@ class BurstWriter(QtCore.QObject):
                     chunks=(max(self.chunk_size * 10, 1000),),
                 )
 
-                # --- Root attributes ---
-                f.attrs["uuid"] = self.camera_meta.get("uuid", "")
-                f.attrs["fuzziness"] = self.camera_meta.get("fuzziness", 0.1)
-                leco_meta = self.camera_meta.get("conduktor_metadata", {})
-                if leco_meta:
-                    f.attrs["conduktor_metadata"] = json.dumps(leco_meta)
+                # --- Root attributes written immediately so the file is
+                #     well-formed even if the process is killed mid-burst ---
                 f.attrs["format_version"] = "burst-v1.0"
                 f.attrs["camera_model"] = self.camera_meta.get("camera_model", "")
                 f.attrs["serial_number"] = self.camera_meta.get("serial_number", "")
@@ -206,21 +208,48 @@ class BurstWriter(QtCore.QObject):
                 f.attrs["max_frames_requested"] = self.max_frames or -1
                 f.attrs["max_seconds_requested"] = self.max_seconds or -1.0
                 f.attrs["created_utc"] = datetime.utcnow().isoformat()
+                f.attrs["sequence_uuid"] = self.camera_meta.get("sequence_uuid", "")
+                f.attrs["fuzziness"] = self.camera_meta.get("fuzziness", 0.1)
+                leco_meta = self.camera_meta.get("conduktor_metadata", {})
+                if leco_meta:
+                    f.attrs["conduktor_metadata"] = json.dumps(leco_meta)
 
-                # --- Accumulation buffers (write in chunks, not one-by-one) ---
-                frame_buf = np.empty((self.chunk_size, w, h), dtype=self.dtype)
+                # --------------------------------------------------------
+                # GATE: block here until the first frame arrives from the
+                # hardware trigger (Line3 FrameStart), or until timeout /
+                # stop is requested.  The acquisition timer starts only
+                # after this gate opens, so the full max_frames / max_seconds
+                # budget is available for actual image data.
+                # --------------------------------------------------------
+                arrived = self._first_frame_event.wait(timeout=self.first_frame_timeout)
+
+                if not arrived:
+                    self.signals.error.emit(
+                        f"No frame received within {self.first_frame_timeout:.0f} s "
+                        f"— check hardware trigger wiring on Line1 / Line3."
+                    )
+                    return
+
+                if self._stop_requested and self._queue.empty():
+                    # Stopped before any frame arrived (user abort while waiting).
+                    self.signals.burst_finished.emit(self._build_summary())
+                    return
+
+                # Timer starts NOW — after the first frame has arrived.
+                self._start_time = time.monotonic()
+                self.signals.first_frame_received.emit()
+
+                # --- Accumulation buffers ---
+                frame_buf = np.empty((self.chunk_size, h, w), dtype=self.dtype)
                 ts_buf = np.empty(self.chunk_size, dtype=np.uint64)
                 buf_idx = 0
-
-                last_progress_time = time.monotonic()
+                last_progress_time = self._start_time
 
                 while True:
-                    # --- Check termination conditions ---
                     elapsed = time.monotonic() - self._start_time
 
-                    if self.max_frames is not None:
-                        if self._frames_written >= self.max_frames:
-                            break
+                    if self.max_frames is not None and self._frames_written >= self.max_frames:
+                        break
 
                     if self.max_seconds is not None and self.max_frames is None:
                         if elapsed >= self.max_seconds:
@@ -229,9 +258,8 @@ class BurstWriter(QtCore.QObject):
                     if self._stop_requested and self._queue.empty():
                         break
 
-                    # --- Drain queue ---
                     try:
-                        item = self._queue.get(timeout=0.005)  # 5 ms timeout
+                        item = self._queue.get(timeout=0.005)
                     except queue.Empty:
                         continue
 
@@ -240,23 +268,21 @@ class BurstWriter(QtCore.QObject):
 
                     frame, ts = item
 
-                    # --- Display throttle ---
+                    # Display throttle
                     total_seen = self._frames_written + buf_idx
                     if total_seen % self.display_every_nth == 0:
                         self.signals.display_frame.emit(frame)
                         self._frames_displayed += 1
 
-                    # --- Buffer the frame ---
+                    # Buffer
                     frame_buf[buf_idx] = frame
                     ts_buf[buf_idx] = ts
                     buf_idx += 1
 
-                    # --- Flush buffer when full ---
                     if buf_idx == self.chunk_size:
                         self._write_chunk(frames_ds, ts_ds, frame_buf, ts_buf, buf_idx)
                         buf_idx = 0
 
-                    # --- Throttled progress signal (every 200 ms) ---
                     now = time.monotonic()
                     if now - last_progress_time >= 0.2:
                         self.signals.progress.emit(
@@ -266,11 +292,11 @@ class BurstWriter(QtCore.QObject):
                         )
                         last_progress_time = now
 
-                # --- Flush any remaining buffered frames ---
+                # Flush remainder
                 if buf_idx > 0:
                     self._write_chunk(frames_ds, ts_ds, frame_buf, ts_buf, buf_idx)
 
-                # --- Write final metadata ---
+                # Final metadata
                 total_elapsed = time.monotonic() - self._start_time
                 f.attrs["frames_written"] = self._frames_written
                 f.attrs["frames_dropped"] = self._frames_dropped
@@ -283,28 +309,27 @@ class BurstWriter(QtCore.QObject):
             self.signals.error.emit(str(exc))
             return
 
-        # --- Emit final summary for LECO publishing ---
         summary = self._build_summary()
         self.signals.progress.emit(
-            self._frames_written, self._frames_dropped, time.monotonic() - self._start_time
+            self._frames_written,
+            self._frames_dropped,
+            time.monotonic() - self._start_time,
         )
         self.signals.burst_finished.emit(summary)
 
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _write_chunk(self, frames_ds, ts_ds, frame_buf, ts_buf, count):
-        """Extend the datasets and write ``count`` frames from the buffers."""
         n = self._frames_written
         frames_ds.resize(n + count, axis=0)
         ts_ds.resize(n + count, axis=0)
-        frames_ds[n : n + count] = frame_buf[:count]
-        ts_ds[n : n + count] = ts_buf[:count]
+        frames_ds[n: n + count] = frame_buf[:count]
+        ts_ds[n: n + count] = ts_buf[:count]
         self._frames_written += count
 
     def _build_summary(self) -> dict:
-        """
-        Build the end-of-burst summary dict.
-        This is what gets published over LECO.
-        """
         elapsed = time.monotonic() - self._start_time if self._start_time else 0.0
         return {
             "message_type": "burst_finished",
@@ -312,16 +337,19 @@ class BurstWriter(QtCore.QObject):
             "h5_path": self.h5_path,
             "camera_model": self.camera_meta.get("camera_model", ""),
             "serial_number": self.camera_meta.get("serial_number", ""),
+            "sequence_uuid": self.camera_meta.get("sequence_uuid", ""),
             "frames_written": self._frames_written,
             "frames_dropped": self._frames_dropped,
             "frames_displayed": self._frames_displayed,
             "elapsed_seconds": elapsed,
             "actual_fps": self._frames_written / elapsed if elapsed > 0 else 0.0,
             "drop_rate_pct": (
-                100.0 * self._frames_dropped / max(self._frames_written + self._frames_dropped, 1)
+                100.0 * self._frames_dropped
+                / max(self._frames_written + self._frames_dropped, 1)
             ),
             "exposure_time_ms": self.camera_meta.get("exposure_time_ms", 0.0),
             "gain": self.camera_meta.get("gain", 0.0),
             "roi": self.camera_meta.get("roi", []),
             "fps_target": self.camera_meta.get("fps_target", 1000),
+            "fuzziness": self.camera_meta.get("fuzziness", 0.1),
         }
