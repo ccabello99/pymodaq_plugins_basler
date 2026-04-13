@@ -515,12 +515,13 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         except Exception:
             dtype = np.uint16
 
-        self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-        self.controller.camera.TriggerMode.SetValue("On")
-        self.controller.camera.TriggerSource.SetValue("Line1")
+        if self.metadata:
+            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
+            self.controller.camera.TriggerMode.SetValue("On")
+            self.controller.camera.TriggerSource.SetValue("Line1")
         self.controller.camera.TriggerSelector.SetValue("FrameStart")
         self.controller.camera.TriggerMode.SetValue("On")
-        self.controller.camera.TriggerSource.SetValue("Line3")
+        self.controller.camera.TriggerSource.SetValue("Line4")
 
         self._burst_writer = BurstWriter(
             h5_path=self._burst_h5_path,
@@ -580,6 +581,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         try:
             self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
             self.controller.camera.TriggerMode.SetValue("Off")
+            self.controller.camera.TriggerSelector.SetValue("FrameStart")
         except Exception:
             pass
 
@@ -636,6 +638,13 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         self.emit_status(ThreadCommand('Update_Status', [status_msg]))
         self._publish_burst_summary(summary)
+        self.metadata = None
+        try:
+            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
+            self.controller.camera.TriggerMode.SetValue("Off")
+            self.controller.camera.TriggerSelector.SetValue("FrameStart")
+        except Exception:
+            pass        
 
     @QtCore.Slot(str)
     def _on_burst_error(self, msg: str):
@@ -652,6 +661,13 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         p = self.settings.child('burst', 'burst_enable')
         p.setValue(False)
         p.sigValueChanged.emit(p, False)
+
+        try:
+            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
+            self.controller.camera.TriggerMode.SetValue("Off")
+            self.controller.camera.TriggerSelector.SetValue("FrameStart")
+        except Exception:
+            pass        
 
         self._set_burst_status(f"ERROR: {msg}")
         self.emit_status(ThreadCommand('Update_Status', [f"Burst error: {msg}", "log"]))
