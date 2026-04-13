@@ -227,7 +227,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             return
 
         if name == "device_state_load":
-            self.controller.stop_grabbing()
+            self.stop()
             self.controller.load_device_state()
             self.controller.setup_acquisition()
             self.add_attributes_to_settings()
@@ -238,19 +238,15 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                     for child in p.children():
                         child.sigValueChanged.emit(child, child.value())
             self._prepare_view()
-            self.controller.start_grabbing(
-                self.settings.param('AcquisitionFrameRateAbs').value()
-            )
+            self.grab_data()
             self.emit_status(ThreadCommand('Update_Status', ["Device state loaded"]))
             return
 
         if name == 'PixelFormat':
-            self.controller.stop_grabbing()
+            self.stop()
             self.controller.camera.PixelFormat.SetValue(value)
             self._prepare_view()
-            self.controller.start_grabbing(
-                self.settings.param('AcquisitionFrameRateAbs').value()
-            )
+            self.grab_data()
             return
 
         if name == 'TriggerSave':
@@ -328,6 +324,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             return
 
         if name == "update_roi" and value:
+            self.stop()
             (old_x, _, old_y, _, xbin, ybin) = self.controller.get_roi()
             y0, x0 = self.roi_info.origin.coordinates
             height, width = self.roi_info.size.coordinates
@@ -338,16 +335,19 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             self.update_rois(new_roi)
             param.setValue(False)
             param.sigValueChanged.emit(param, False)
+            self.grab_data()
         elif name == 'binning':
             (x0, w, y0, h, *_) = self.controller.get_roi()
             b = value
             self.update_rois((x0, w, b, y0, h, b))
         elif name == "clear_roi" and value:
+            self.stop()
             wdet, hdet = self.controller.get_detector_size()
             self.settings.child('roi', 'binning').setValue(1)
             self.update_rois((0, wdet, 1, 0, hdet, 1))
             param.setValue(False)
             param.sigValueChanged.emit(param, False)
+            self.grab_data()
 
     def grab_data(self, Naverage: int = 1, live: bool = False, **kwargs) -> None:
         try:
@@ -356,7 +356,10 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             try:
                 frame_rate = self.settings.param('AcquisitionFrameRateAbs').value()
             except Exception:
-                frame_rate = None
+                try:
+                    frame_rate = self.settings.param('AcquisitionFrameRate').value()
+                except Exception:
+                    frame_rate = None
 
             burst_armed = self.settings.child('burst', 'burst_enable').value()
             trigger_on = False
@@ -813,7 +816,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
                 hbin=new_xbinning, vbin=new_ybinning,
             )
             self.emit_status(ThreadCommand('Update_Status', [f'Changed ROI: {new_roi}']))
-            self.controller.clear_acquisition()
             self.controller.setup_acquisition()
             self._prepare_view()
 
