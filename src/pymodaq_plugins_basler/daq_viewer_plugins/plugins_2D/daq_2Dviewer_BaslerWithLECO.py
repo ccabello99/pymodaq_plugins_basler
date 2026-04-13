@@ -518,11 +518,11 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         if self.metadata is not None:
             burst_meta = self.metadata.get('burst_metadata', {})
             detector_meta = self.metadata.get('detector_metadata', {})
-            camera_meta['uuid'] = burst_meta.get('uuid', str(uuid7()))
+            camera_meta['sequence_uuid'] = burst_meta.get('sequence_uuid', str(uuid7()))
             camera_meta['fuzziness'] = detector_meta.get('fuzziness', 0.1)
             camera_meta['conduktor_metadata'] = self.metadata
         else:
-            camera_meta['uuid'] = str(uuid7())
+            camera_meta['sequence_uuid'] = str(uuid7())
             camera_meta['fuzziness'] = 0.1
             camera_meta['conduktor_metadata'] = {}        
 
