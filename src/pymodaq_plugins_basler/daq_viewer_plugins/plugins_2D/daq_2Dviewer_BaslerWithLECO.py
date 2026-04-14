@@ -454,12 +454,17 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         if self.metadata is not None:
             filepath = self.metadata['file_metadata']['filepath']
+            filename = self.metadata['file_metadata']['filename']
             self.metadata['burst_metadata']['user_id'] = self.user_id
             basepath = self.settings.child('leco_log', 'leco_basepath').value()
             prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
-            self._burst_h5_path = os.path.normpath(
-                os.path.join(basepath, f"{prefix}_{filepath.lstrip(os.path.sep)}.h5")
+            filepath = os.path.normpath(
+                os.path.join(basepath, f"{prefix}_{filepath.lstrip(os.path.sep)}")
             )
+            fname = filename if filename.endswith('.h5') else filename + '.h5'
+            full_path = os.path.join(filepath, fname)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)            
+            self._burst_h5_path = full_path
         else:
             save_dir = self.settings.child('burst', 'burst_path').value()
             if not save_dir:
