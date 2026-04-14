@@ -65,7 +65,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             {'title': 'Enable Burst Mode', 'name': 'burst_enable',
              'type': 'led_push', 'value': False, 'default': False,
              'tip': 'Arms burst mode. Triggers camera and waits for Line1 '
-                    '(FrameBurstStart) then Line3 (FrameStart) hardware triggers.'},
+                    '(FrameStart) then Line4 (FrameStart) hardware triggers.'},
             {'title': 'Save Path', 'name': 'burst_path',
              'type': 'browsepath', 'value': '', 'filetype': False},
             {'title': 'Filename Prefix', 'name': 'burst_prefix',
@@ -437,6 +437,12 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         self.stop()
 
+        # Make sure trigger save is off 
+        self.save_frame = False
+        p = self.settings.child('trigger', 'TriggerSaveOptions', 'TriggerSave')
+        p.setValue(False)
+        p.sigValueChanged.emit(p, False)
+
         max_frames = self.settings.child('burst', 'burst_stop_group', 'burst_nframes').value()
         max_seconds = self.settings.child('burst', 'burst_stop_group', 'burst_nseconds').value()
         if max_frames == 0 and max_seconds == 0.0:
@@ -515,14 +521,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         except Exception:
             dtype = np.uint16
 
-        if self.metadata:
-            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-            self.controller.camera.TriggerMode.SetValue("On")
-            self.controller.camera.TriggerSource.SetValue("Line1")
-        self.controller.camera.TriggerSelector.SetValue("FrameStart")
-        self.controller.camera.TriggerMode.SetValue("On")
-        self.controller.camera.TriggerSource.SetValue("Line4")
-
         self._burst_writer = BurstWriter(
             h5_path=self._burst_h5_path,
             frame_shape=(actual_height, actual_width),  # (H, W) numpy convention
@@ -577,13 +575,6 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             self._burst_thread.wait(5000)
 
         self._burst_active = False
-
-        try:
-            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-            self.controller.camera.TriggerMode.SetValue("Off")
-            self.controller.camera.TriggerSelector.SetValue("FrameStart")
-        except Exception:
-            pass
 
     @QtCore.Slot()
     def _on_burst_first_frame(self):
@@ -640,9 +631,8 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         self._publish_burst_summary(summary)
         self.metadata = None
         try:
-            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-            self.controller.camera.TriggerMode.SetValue("Off")
             self.controller.camera.TriggerSelector.SetValue("FrameStart")
+            self.controller.camera.TriggerMode.SetValue("Off")
         except Exception:
             pass        
 
@@ -663,9 +653,8 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         p.sigValueChanged.emit(p, False)
 
         try:
-            self.controller.camera.TriggerSelector.SetValue("FrameBurstStart")
-            self.controller.camera.TriggerMode.SetValue("Off")
             self.controller.camera.TriggerSelector.SetValue("FrameStart")
+            self.controller.camera.TriggerMode.SetValue("Off")
         except Exception:
             pass        
 
