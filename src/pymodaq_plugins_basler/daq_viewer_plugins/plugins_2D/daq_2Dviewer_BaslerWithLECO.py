@@ -389,8 +389,8 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         if self.save_frame:
             self.handle_metadata_and_saving(frame, timestamp, frame.shape)
+            self.metadata = None
 
-        self.metadata = None
         self.controller.imageEventHandler.frame_ready = False
 
     def stop(self):
@@ -458,7 +458,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             basepath = self.settings.child('leco_log', 'leco_basepath').value()
             prefix = self.settings.child('burst', 'burst_prefix').value() or 'burst'
             self._burst_h5_path = os.path.normpath(
-                os.path.join(basepath, f"{prefix}_{filepath.lstrip(os.path.sep)}")
+                os.path.join(basepath, f"{prefix}_{filepath.lstrip(os.path.sep)}.h5")
             )
         else:
             save_dir = self.settings.child('burst', 'burst_path').value()
