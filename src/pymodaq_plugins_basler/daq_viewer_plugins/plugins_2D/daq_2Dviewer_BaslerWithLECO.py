@@ -555,7 +555,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         self.controller.start_grabbing(frame_rate, burst_mode=True)
 
         self.emit_status(ThreadCommand('Update_Status',
-                                       [f"Burst armed → {self._burst_h5_path}"]))
+                                       [f"Burst armed : {self._burst_h5_path}"]))
 
     def _stop_burst(self, wait: bool = False):
         """Request the writer to stop and clean up."""
