@@ -343,7 +343,8 @@ class BurstWriter(QtCore.QObject):
                     / max(self._frames_written + self._frames_dropped, 1)
                 ),
                 "burst_metadata": {
-                    "uuid": self.camera_meta.get("sequence_uuid", ""),
+                    "uuid": self.camera_meta.get("uuid", ""),
+                    "sequence_uuid": self.camera_meta.get("sequence_uuid", ""),
                     "user_id": self.camera_meta.get("serial_number", ""),
                     "frames_written": self._frames_written,
                     "frames_dropped": self._frames_dropped,
