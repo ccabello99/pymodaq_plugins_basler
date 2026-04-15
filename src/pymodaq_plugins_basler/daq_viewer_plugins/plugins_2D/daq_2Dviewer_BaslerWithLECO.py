@@ -616,15 +616,15 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
         self._burst_writer = None
 
         self._set_burst_readouts(
-            summary['frames_written'],
-            summary['frames_dropped'],
-            summary['elapsed_seconds'],
+            summary['metadata']['burst_metadata']['frames_written'],
+            summary['metadata']['burst_metadata']['frames_dropped'],
+            summary['metadata']['burst_metadata']['elapsed_seconds'],
         )
-        drop_pct = summary['drop_rate_pct']
+        drop_pct = summary['metadata']['drop_rate_pct']
         status_msg = (
-            f"Done – {summary['frames_written']} frames, "
+            f"Done – {summary['metadata']['burst_metadata']['frames_written']} frames, "
             f"{drop_pct:.1f}% dropped, "
-            f"{summary['actual_fps']:.1f} fps"
+            f"{summary['metadata']['actual_fps']:.1f} fps"
         )
         self._set_burst_status(status_msg)
 

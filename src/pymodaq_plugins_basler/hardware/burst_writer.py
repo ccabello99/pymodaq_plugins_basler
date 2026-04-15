@@ -335,31 +335,33 @@ class BurstWriter(QtCore.QObject):
         h5_filename = os.path.basename(self.h5_path)
         return {
             "message_type": "detector",
-            "format_version": "burst-v1.0",
-            "actual_fps": self._frames_written / elapsed if elapsed > 0 else 0.0,
-            "drop_rate_pct": (
-                100.0 * self._frames_dropped
-                / max(self._frames_written + self._frames_dropped, 1)
-            ),
-            "burst_metadata": {
-                "uuid": self.camera_meta.get("sequence_uuid", ""),
-                "user_id": self.camera_meta.get("serial_number", ""),
-                "frames_written": self._frames_written,
-                "frames_dropped": self._frames_dropped,
-                "frames_displayed": self._frames_displayed,
-                "elapsed_seconds": elapsed,
-                "fps_target": self.camera_meta.get("fps_target", 1000),
-            },
-            "file_metadata": {
-                "filepath": h5_dir,
-                "filename": h5_filename,
-            },
-            "detector_metadata": {
-                "fuzziness": self.camera_meta.get("fuzziness", 0.1),
-                "gain": self.camera_meta.get("gain", 0.0),
-                "exposure_time": self.camera_meta.get("exposure_time_ms", 0.0),
-                "shape": self.camera_meta.get("roi", []),
-                "camera_model": self.camera_meta.get("camera_model", ""),
-                "serial_number": self.camera_meta.get("serial_number", ""),
-            },
+            'metadata': {
+                "format_version": "burst-v1.0",
+                "actual_fps": self._frames_written / elapsed if elapsed > 0 else 0.0,
+                "drop_rate_pct": (
+                    100.0 * self._frames_dropped
+                    / max(self._frames_written + self._frames_dropped, 1)
+                ),
+                "burst_metadata": {
+                    "uuid": self.camera_meta.get("sequence_uuid", ""),
+                    "user_id": self.camera_meta.get("serial_number", ""),
+                    "frames_written": self._frames_written,
+                    "frames_dropped": self._frames_dropped,
+                    "frames_displayed": self._frames_displayed,
+                    "elapsed_seconds": elapsed,
+                    "fps_target": self.camera_meta.get("fps_target", 1000),
+                },
+                "file_metadata": {
+                    "filepath": h5_dir,
+                    "filename": h5_filename,
+                },
+                "detector_metadata": {
+                    "fuzziness": self.camera_meta.get("fuzziness", 0.1),
+                    "gain": self.camera_meta.get("gain", 0.0),
+                    "exposure_time": self.camera_meta.get("exposure_time_ms", 0.0),
+                    "shape": self.camera_meta.get("roi", []),
+                    "camera_model": self.camera_meta.get("camera_model", ""),
+                    "serial_number": self.camera_meta.get("serial_number", ""),
+                }
+            }
         }
