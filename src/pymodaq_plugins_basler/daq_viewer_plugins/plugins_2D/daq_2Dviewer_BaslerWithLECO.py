@@ -464,7 +464,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             fname = filename if filename.endswith('.h5') else filename + '.h5'
             full_path = os.path.join(filepath, fname)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)            
-            self._burst_h5_path = full_path
+            self._burst_h5_path = filepath
         else:
             save_dir = self.settings.child('burst', 'burst_path').value()
             if not save_dir:
