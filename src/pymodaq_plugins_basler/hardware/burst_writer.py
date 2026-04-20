@@ -133,10 +133,6 @@ class BurstWriter(QtCore.QObject):
 
         self.signals = BurstWriterSignals()
 
-    # ------------------------------------------------------------------
-    # Public API (called from grab callback thread)
-    # ------------------------------------------------------------------
-
     def enqueue(self, frame: np.ndarray, timestamp: int) -> bool:
         """
         Put a frame into the writer queue.  Thread-safe, returns in microseconds.
@@ -167,10 +163,6 @@ class BurstWriter(QtCore.QObject):
         # waiting for the hardware trigger (e.g. user aborts).
         self._first_frame_event.set()
         self._queue.put_nowait(_STOP_SENTINEL)
-
-    # ------------------------------------------------------------------
-    # Worker entry point
-    # ------------------------------------------------------------------
 
     def run(self):
         h, w = self.frame_shape
@@ -317,9 +309,6 @@ class BurstWriter(QtCore.QObject):
         )
         self.signals.burst_finished.emit(summary)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     def _write_chunk(self, frames_ds, ts_ds, frame_buf, ts_buf, count):
         n = self._frames_written

@@ -528,7 +528,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
 
         try:
             pf = self.controller.camera.PixelFormat.GetValue()
-            dtype = np.uint16 if '12' in pf or '16' in pf else np.uint8
+            dtype = np.uint16 if '12' in pf or '16' in pf or '10' in pf else np.uint8
         except Exception:
             dtype = np.uint16
 
