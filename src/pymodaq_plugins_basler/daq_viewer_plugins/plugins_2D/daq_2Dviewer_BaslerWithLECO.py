@@ -189,7 +189,10 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             base_path = ''
         self.settings.child('leco_log', 'leco_basepath').setValue(base_path)
 
-        self.controller.camera.SensorReadoutMode.SetValue("Fast")
+        try:
+            self.controller.camera.SensorReadoutMode.SetValue("Fast")
+        except Exception:
+            pass
 
         if not self.settings.child('burst', 'burst_path').value():
             self.settings.child('burst', 'burst_path').setValue(
