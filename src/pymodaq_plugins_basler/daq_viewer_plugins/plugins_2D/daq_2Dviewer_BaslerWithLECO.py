@@ -189,6 +189,8 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             base_path = ''
         self.settings.child('leco_log', 'leco_basepath').setValue(base_path)
 
+        self.controller.camera.SensorReadoutMode.SetValue("Fast")
+
         if not self.settings.child('burst', 'burst_path').value():
             self.settings.child('burst', 'burst_path').setValue(
                 os.path.join(os.path.expanduser('~'), 'Downloads')
@@ -464,7 +466,7 @@ class DAQ_2DViewer_BaslerWithLECO(DAQ_Viewer_base):
             fname = filename if filename.endswith('.h5') else filename + '.h5'
             full_path = os.path.join(filepath, fname)
             os.makedirs(os.path.dirname(full_path), exist_ok=True)            
-            self._burst_h5_path = filepath
+            self._burst_h5_path = full_path
         else:
             save_dir = self.settings.child('burst', 'burst_path').value()
             if not save_dir:

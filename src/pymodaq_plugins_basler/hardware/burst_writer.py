@@ -331,7 +331,7 @@ class BurstWriter(QtCore.QObject):
 
     def _build_summary(self) -> dict:
         elapsed = time.monotonic() - self._start_time if self._start_time else 0.0
-        h5_dir = os.path.dirname(self.h5_path)
+        h5_dir = os.path.basename(os.path.dirname(self.h5_path))
         h5_filename = os.path.basename(self.h5_path)
         return {
             "message_type": "detector",
