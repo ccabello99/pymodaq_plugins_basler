@@ -320,6 +320,7 @@ class BurstWriter(QtCore.QObject):
 
     def _build_summary(self) -> dict:
         elapsed = time.monotonic() - self._start_time if self._start_time else 0.0
+        timestamp_approx = time.time_ns()-elapsed*1e9 # Workaround
         h5_dir = os.path.basename(os.path.dirname(self.h5_path))
         h5_filename = os.path.basename(self.h5_path)
         return {
@@ -339,6 +340,8 @@ class BurstWriter(QtCore.QObject):
                     "frames_dropped": self._frames_dropped,
                     "frames_displayed": self._frames_displayed,
                     "elapsed_seconds": elapsed,
+                    "timestamp" : timestamp_approx,
+                    "data_source": self.camera_meta.get('conduktor_metadata',{}).get("burst_metadata",{}).get("data_source",""),
                     "fps_target": self.camera_meta.get("fps_target", 1000),
                 },
                 "file_metadata": {
